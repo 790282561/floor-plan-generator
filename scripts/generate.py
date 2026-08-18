@@ -46,6 +46,11 @@ def acad_2d(coords):
     return VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8, flat)
 
 
+def entity_array(entities):
+    """构造 COM 实体数组 (VT_ARRAY | VT_DISPATCH)，用于 Hatch 边界"""
+    return VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, list(entities))
+
+
 class FloorPlanConfig:
     """户型图配置类"""
 
@@ -272,6 +277,56 @@ class FloorPlanGenerator:
             pass
         return t
 
+    def _add_solid_fill(self, outer, inners=None, layer="WALLS"):
+        """为闭合边界添加 SOLID 实心填充，墙体禁止只画空心矩形框
+
+        outer: 外边界闭合多段线; inners: 可选内边界列表（挖空，用于外墙环形填充）
+        """
+        hatch = None
+        try:
+            # 1 = acHatchPatternTypePreDefined, "SOLID" 实心图案, 非关联
+            hatch = self.msp.AddHatch(1, "SOLID", False)
+            hatch.AppendOuterLoop(entity_array([outer]))
+            ok = True
+            if inners:
+                for inner in inners:
+                    try:
+                        hatch.AppendInnerLoop(entity_array([inner]))
+                    except Exception:
+                        ok = False
+                        break
+            if not ok:
+                # 内环不可用时放弃填充，避免把整个外轮廓填实
+                try:
+                    hatch.Delete()
+                except Exception:
+                    pass
+                print("    [警告] 当前 CAD 不支持填充内环，外墙未填充")
+                return None
+            hatch.Layer = layer
+            try:
+                hatch.Evaluate()
+            except Exception:
+                pass
+            return hatch
+        except Exception as e:
+            print(f"    [警告] 墙体填充失败: {e}")
+            if hatch is not None:
+                try:
+                    hatch.Delete()
+                except Exception:
+                    pass
+            return None
+
+    def _add_wall_strip(self, x1, y1, x2, y2, layer="INNER_WALLS"):
+        """按墙厚条带绘制墙体：闭合双线轮廓 + SOLID 实心填充"""
+        rect = self._add_lwpolyline(
+            [(x1, y1), (x2, y1), (x2, y2), (x1, y2)],
+            layer=layer, close=True
+        )
+        self._add_solid_fill(rect, inners=None, layer=layer)
+        return rect
+
     # ------------------------------------------------------------------
     # 布局设计
     # ------------------------------------------------------------------
@@ -440,7 +495,7 @@ class FloorPlanGenerator:
     # 图元绘制
     # ------------------------------------------------------------------
     def draw_outer_walls(self):
-        """绘制外墙（双线）"""
+        """绘制外墙（双线 + 环形实心填充）"""
         wall = self.config.wall_thickness
 
         all_rooms = list(self.layout.values())
@@ -450,13 +505,13 @@ class FloorPlanGenerator:
         max_y = max(r["y"] + r["height"] for r in all_rooms) + wall
 
         # 外边
-        self._add_lwpolyline(
+        outer_poly = self._add_lwpolyline(
             [(min_x, min_y), (max_x, min_y), (max_x, max_y), (min_x, max_y)],
             layer="WALLS", close=True
         )
 
         # 内边
-        self._add_lwpolyline(
+        inner_poly = self._add_lwpolyline(
             [(min_x + wall, min_y + wall),
              (max_x - wall, min_y + wall),
              (max_x - wall, max_y - wall),
@@ -464,8 +519,11 @@ class FloorPlanGenerator:
             layer="WALLS", close=True
         )
 
+        # 双线之间的环形区域做 SOLID 实心填充
+        self._add_solid_fill(outer_poly, inners=[inner_poly], layer="WALLS")
+
     def draw_inner_walls(self):
-        """绘制内墙"""
+        """绘制内墙（墙厚条带 + 实心填充，双线轮廓）"""
         wall = self.config.wall_thickness
 
         for name, room in self.layout.items():
@@ -473,16 +531,10 @@ class FloorPlanGenerator:
             x, y = room["x"], room["y"]
             w, h = room["width"], room["height"]
 
-            # 上边
-            self._add_lwpolyline(
-                [(x, y + h - wall), (x + w, y + h - wall)],
-                layer="INNER_WALLS"
-            )
-            # 右边
-            self._add_lwpolyline(
-                [(x + w - wall, y), (x + w - wall, y + h)],
-                layer="INNER_WALLS"
-            )
+            # 上边条带
+            self._add_wall_strip(x, y + h - wall, x + w, y + h, layer="INNER_WALLS")
+            # 右边条带
+            self._add_wall_strip(x + w - wall, y, x + w, y + h, layer="INNER_WALLS")
 
     def draw_doors(self):
         """绘制门"""
