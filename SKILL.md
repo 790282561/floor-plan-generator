@@ -10,7 +10,7 @@ description: 根据户型图片分阶段识别并生成具有真实墙厚的墙�
 根据户型图片、草图或 CAD 截图，识别建筑外轮廓、墙体、房间、门、窗和尺寸，建立统一毫米坐标模型，生成可编辑的建筑平面图。
 所有墙体必须使用具有实际厚度的双线表达；门窗必须形成真实墙体洞口，不得只将符号叠加在连续墙线上。
 ### 1.2 适用范围
-适用于户型图重绘、草图规范化、墙体拓扑重建、窗洞窗框生成、门洞门扇及开启弧生成、房间标注、尺寸标注和 CAD 输出。
+适用于户型图重绘、草图规范化、墙体拓扑重建、窗洞窗框生成、门洞门扇及开启弧生成、房间名称标注、尺寸标注和 CAD 输出。
 
 ### 1.3 脚本调用总原则
 图形生成必须严格调用当前项目 `scripts` 目录中的实际程序，不得自行替换为不存在的脚本或绕过脚本直接猜画。图片任务必须依次调用 `processing.py`、`generate_by_pic.py`、`generate_windows.py` 和 `generate_doors.py`。
@@ -43,16 +43,16 @@ description: 根据户型图片分阶段识别并生成具有真实墙厚的墙�
 ### 2.12 建筑规则校核
 校核外轮廓、墙体连续性、墙厚、房间闭合性、门窗位置、洞口关系、开启方向、比例和交通关系。
 ### 2.13 生成结构化数据
-生成 Wall、Opening、Door、Window、Room 和 UncertainObject 数据。用户要求优先于图片明确尺寸，图片明确尺寸优先于几何推定。
+生成 Wall、Opening、Door、Window、Room 和 UncertainObject 数据。用户要求优先于图片明确尺寸，图片明确尺寸优先于几何推定。Room 必须包含房间名称、文字位置、文字高度、文字样式和来源置信度。
 ### 2.14 脚本驱动的 CAD 生成
 不得直接由 Skill 手工绘制图形，必须按图片阶段调用对应脚本：预处理调用 `processing.py`，墙体调用 `generate_by_pic.py`，窗户调用 `generate_windows.py`，门调用 `generate_doors.py`。各阶段的 DXF 输出必须作为下一阶段的输入。
 ### 2.15 绘后检查
-每个生成脚本都必须读取其输出的同名 JSON 报告并完成阶段验收：墙体阶段确认 `wall_geometry_valid == true`、`wall_boundary_lines == 0`、`wall_open_polylines == 0`、`wall_closed_polylines > 0` 且 `audit_errors == 0`；窗户阶段确认 `accepted_windows > 0`、`topology.wall_overlaps_after == 0` 且 `audit_errors == 0`；门阶段确认 `accepted_doors > 0`、`topology.wall_overlaps_after == 0`、`topology.door_geometry_collision_count == 0` 且 `audit_errors == 0`。任一条件不满足时停止，不得进入下一阶段。静态验收通过后仍需检查 PNG 预览和目标 CAD 实际显示。
+每个生成脚本都必须读取其输出的同名 JSON 报告并完成阶段验收：墙体阶段确认 `wall_geometry_valid == true`、`wall_boundary_lines == 0`、`wall_open_polylines == 0`、`wall_closed_polylines > 0` 且 `audit_errors == 0`；窗户阶段确认 `accepted_windows > 0`、`topology.wall_overlaps_after == 0` 且 `audit_errors == 0`；门阶段确认 `accepted_doors > 0`、`topology.wall_overlaps_after == 0`、`topology.door_geometry_collision_count == 0` 且 `audit_errors == 0`。最终图还必须检查房间名称数量、文字内容、文字高度、文字样式、居中位置、无遮挡和无乱码。任一条件不满足时停止，不得进入下一阶段。静态验收通过后仍需检查 PNG 预览和目标 CAD 实际显示。
 ### 2.16 局部纠错
 只修改对应局部对象，并重新检查相邻墙体、门窗、房间和尺寸关系。不得因局部纠错改变无关区域。
 
 ### 2.17 预处理证据的使用边界
-`processing.py` 生成的 `result.json`、`overlay.png` 和 masks 是识别证据与审计记录，不是门窗几何的直接输入。窗户位置和几何必须由 `generate_windows.py` 根据图片和墙体 DXF 重新计算；门的位置、门型和开启方向必须由 `generate_doors.py` 根据当前含门图片、上一阶段图片和墙窗 DXF 重新计算。不得把 `result.json` 中的候选框直接转换为 CAD 门窗。
+`processing.py` 生成的 `result.json`、`overlay.png` 和 masks 是识别证据与审计记录，不是门窗几何的直接输入。窗户位置和几何必须由 `generate_windows.py` 根据图片和墙体 DXF 重新计算；门的位置、门型和开启方向必须由 `generate_doors.py` 根据当前含门图片、上一阶段图片和墙窗 DXF 重新计算。房间名称必须使用 OCR 明确识别的文字或用户提供的名称，并转换为统一的 CAD 文字实体；OCR 为 null 或低置信度时不得擅自补写。不得把候选框直接当作确定文字或 CAD 门窗。
 
 ## 3. 数据模型
 ### 3.1 Wall
@@ -64,7 +64,7 @@ description: 根据户型图片分阶段识别并生成具有真实墙厚的墙�
 ### 3.4 Window
 包含 opening_id、type、position、width、frame_lines、source 和 confidence。
 ### 3.5 Room
-包含 id、name、x、y、width、height、boundary_walls、source 和 confidence；房间应由墙体围合形成闭合空间。
+包含 id、name、x、y、width、height、boundary_walls、label_position、text_height、text_style、source 和 confidence；房间应由墙体围合形成闭合空间。`name` 必须与图片明确文字或用户要求一致。
 ### 3.6 UncertainObject
 记录模糊、重叠或无法确认的墙体、门窗、文字和尺寸候选，包含 geometry、reason、confidence 和 INFERRED 状态。
 
@@ -104,7 +104,7 @@ description: 根据户型图片分阶段识别并生成具有真实墙厚的墙�
 ### 6.4 窗
 在 WINDOWS 图层绘制窗框；窗洞必须切断所属墙体，窗框位于洞口内部且方向与墙体一致。
 ### 6.5 文字
-房间名称优先使用用户输入或图片明确文字，文字放在对应房间内部，不得遮挡墙体、门窗和尺寸。
+房间名称必须生成到 `ROOM_NAMES` 图层。所有房间名称使用统一的文字样式和统一文字高度，文字基点位于对应房间几何中心或经校核的室内空白区域，并使用居中对齐。文字内容必须与图片 OCR 明确结果或用户指定名称一致，不得擅自翻译、缩写或改名；OCR 不确定时标记 `INFERRED` 并停止自动落图。文字不得覆盖墙体、门窗、尺寸和其他房间名称，不得出现乱码。
 ### 6.6 尺寸
 按可靠尺寸建立比例并绘制必要尺寸。推定尺寸必须与确定尺寸区分，尺寸线应离开建筑墙体并保持清晰间隙。
 
@@ -130,6 +130,8 @@ description: 根据户型图片分阶段识别并生成具有真实墙厚的墙�
 - `generate_by_pic.py` 只负责图片墙体及墙体尺寸 DXF。
 - `generate_windows.py` 只负责在已校核墙体 DXF 上切窗洞并生成窗框。
 - `generate_doors.py` 只负责在已校核墙体和窗户 DXF 上切门洞并生成门图形。
+
+当前脚本链尚未在 `generate_by_pic.py`、`generate_windows.py` 或 `generate_doors.py` 中提供房间名称落图入口；在该能力补入现有图片生成脚本前，不得宣称“房间名称已生成完成”。房间文字实现必须继续使用现有图片流程，并输出 `ROOM_NAMES` 图层及对应 JSON 记录，不得恢复文字尺寸独立生成路线。
 
 不得使用不存在的 `generate.py`，不得让 `generate_by_pic.py` 代替门窗脚本，也不得让门窗脚本跳过前置墙体结果。
 
