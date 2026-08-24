@@ -1,0 +1,344 @@
+{
+  "source": "D:\\中建科技\\009_自动化软件平台\\ref_pic_3.jpg",
+  "output": "D:\\中建科技\\009_自动化软件平台\\floor-plan-generator\\outputs\\ref_pic_3\\ref_pic_3_walls_v3.dxf",
+  "overall_width_mm": 8440.0,
+  "overall_height_mm": 7790.0,
+  "horizontal_chain_mm": [
+    1000.0,
+    3320.0,
+    120.0,
+    4000.0
+  ],
+  "vertical_chain_top_down_mm": [
+    890.0,
+    4740.0,
+    240.0,
+    1920.0
+  ],
+  "wall_boundary_lines": 0,
+  "wall_closed_polylines": 4,
+  "wall_boundary_edges": 50,
+  "wall_topology": "closed-polylines",
+  "audit_errors": 0,
+  "audit_fixes": 0,
+  "horizontal_boundary_lines": 0,
+  "vertical_boundary_lines": 0,
+  "closed_wall_polylines": 4,
+  "closed_wall_boundary_edges": 50,
+  "extraction_mode": "solid-wall-boundaries",
+  "solid_wall_ratio": 0.7704,
+  "estimated_wall_thickness_px": 18.0,
+  "wall_width_candidates_mm": [
+    240.0,
+    180.0,
+    120.0
+  ],
+  "wall_width_assignments": [
+    {
+      "orientation": "horizontal",
+      "pixel_bbox": {
+        "x": 333,
+        "y": 94,
+        "width": 154,
+        "height": 17
+      },
+      "measured_width_mm": 145.607,
+      "assigned_width_mm": 120.0,
+      "role": "interior",
+      "source": "INTERIOR_RULE",
+      "rectangle_mm": [
+        3064.907,
+        6801.752,
+        4440.0,
+        6921.752
+      ],
+      "pixel_area": 2618
+    },
+    {
+      "orientation": "horizontal",
+      "pixel_bbox": {
+        "x": 105,
+        "y": 214,
+        "width": 82,
+        "height": 21
+      },
+      "measured_width_mm": 182.009,
+      "assigned_width_mm": 120.0,
+      "role": "interior",
+      "source": "INTERIOR_RULE",
+      "rectangle_mm": [
+        975.441,
+        5691.495,
+        1711.93,
+        5811.495
+      ],
+      "pixel_area": 1722
+    },
+    {
+      "orientation": "horizontal",
+      "pixel_bbox": {
+        "x": 469,
+        "y": 216,
+        "width": 208,
+        "height": 19
+      },
+      "measured_width_mm": 163.808,
+      "assigned_width_mm": 120.0,
+      "role": "interior",
+      "source": "INTERIOR_RULE",
+      "rectangle_mm": [
+        4320.0,
+        5682.395,
+        6221.854,
+        5802.395
+      ],
+      "pixel_area": 3952
+    },
+    {
+      "orientation": "horizontal",
+      "pixel_bbox": {
+        "x": 859,
+        "y": 216,
+        "width": 59,
+        "height": 19
+      },
+      "measured_width_mm": 163.808,
+      "assigned_width_mm": 120.0,
+      "role": "interior",
+      "source": "INTERIOR_RULE",
+      "rectangle_mm": [
+        7906.172,
+        5682.395,
+        8440.0,
+        5802.395
+      ],
+      "pixel_area": 1121
+    },
+    {
+      "orientation": "horizontal",
+      "pixel_bbox": {
+        "x": 79,
+        "y": 618,
+        "width": 406,
+        "height": 19
+      },
+      "measured_width_mm": 163.808,
+      "assigned_width_mm": 240.0,
+      "role": "dimensioned",
+      "source": "DIMENSION_CHAIN",
+      "rectangle_mm": [
+        727.11,
+        1920.0,
+        4454.7,
+        2160.0
+      ],
+      "pixel_area": 7714
+    },
+    {
+      "orientation": "horizontal",
+      "pixel_bbox": {
+        "x": 586,
+        "y": 619,
+        "width": 178,
+        "height": 17
+      },
+      "measured_width_mm": 145.608,
+      "assigned_width_mm": 240.0,
+      "role": "dimensioned",
+      "source": "DIMENSION_CHAIN",
+      "rectangle_mm": [
+        5393.501,
+        1920.0,
+        7027.371,
+        2160.0
+      ],
+      "pixel_area": 3026
+    },
+    {
+      "orientation": "horizontal",
+      "pixel_bbox": {
+        "x": 2,
+        "y": 836,
+        "width": 780,
+        "height": 20
+      },
+      "measured_width_mm": 172.909,
+      "assigned_width_mm": 180.0,
+      "role": "exterior",
+      "source": "IMAGE+EXTERIOR_RULE",
+      "rectangle_mm": [
+        0.0,
+        0.0,
+        7188.266,
+        180.0
+      ],
+      "pixel_area": 15600
+    },
+    {
+      "orientation": "horizontal",
+      "pixel_bbox": {
+        "x": 877,
+        "y": 836,
+        "width": 41,
+        "height": 20
+      },
+      "measured_width_mm": 172.909,
+      "assigned_width_mm": 180.0,
+      "role": "exterior",
+      "source": "IMAGE+EXTERIOR_RULE",
+      "rectangle_mm": [
+        8071.843,
+        0.0,
+        8440.0,
+        180.0
+      ],
+      "pixel_area": 820
+    },
+    {
+      "orientation": "vertical",
+      "pixel_bbox": {
+        "x": 899,
+        "y": 0,
+        "width": 18,
+        "height": 857
+      },
+      "measured_width_mm": 156.467,
+      "assigned_width_mm": 180.0,
+      "role": "exterior",
+      "source": "IMAGE+EXTERIOR_RULE",
+      "rectangle_mm": [
+        8260.0,
+        0.0,
+        8440.0,
+        7790.0
+      ],
+      "pixel_area": 15209
+    },
+    {
+      "orientation": "vertical",
+      "pixel_bbox": {
+        "x": 467,
+        "y": 94,
+        "width": 19,
+        "height": 420
+      },
+      "measured_width_mm": 165.671,
+      "assigned_width_mm": 120.0,
+      "role": "dimensioned",
+      "source": "DIMENSION_CHAIN",
+      "rectangle_mm": [
+        4320.0,
+        3121.46,
+        4440.0,
+        6921.752
+      ],
+      "pixel_area": 7273
+    },
+    {
+      "orientation": "vertical",
+      "pixel_bbox": {
+        "x": 104,
+        "y": 215,
+        "width": 18,
+        "height": 423
+      },
+      "measured_width_mm": 156.467,
+      "assigned_width_mm": 120.0,
+      "role": "interior",
+      "source": "INTERIOR_RULE",
+      "rectangle_mm": [
+        975.441,
+        1920.0,
+        1095.441,
+        5802.395
+      ],
+      "pixel_area": 7614
+    },
+    {
+      "orientation": "vertical",
+      "pixel_bbox": {
+        "x": 752,
+        "y": 620,
+        "width": 11,
+        "height": 237
+      },
+      "measured_width_mm": 92.039,
+      "assigned_width_mm": 120.0,
+      "role": "interior",
+      "source": "INTERIOR_RULE",
+      "rectangle_mm": [
+        6907.371,
+        0.0,
+        7027.371,
+        2160.0
+      ],
+      "pixel_area": 2607
+    },
+    {
+      "orientation": "vertical",
+      "pixel_bbox": {
+        "x": 585,
+        "y": 724,
+        "width": 11,
+        "height": 133
+      },
+      "measured_width_mm": 92.039,
+      "assigned_width_mm": 120.0,
+      "role": "interior",
+      "source": "INTERIOR_RULE",
+      "rectangle_mm": [
+        5370.316,
+        0.0,
+        5490.316,
+        1201.262
+      ],
+      "pixel_area": 1463
+    },
+    {
+      "orientation": "vertical",
+      "pixel_bbox": {
+        "x": 428,
+        "y": 730,
+        "width": 12,
+        "height": 127
+      },
+      "measured_width_mm": 101.243,
+      "assigned_width_mm": 120.0,
+      "role": "interior",
+      "source": "INTERIOR_RULE",
+      "rectangle_mm": [
+        3929.901,
+        0.0,
+        4049.901,
+        1146.659
+      ],
+      "pixel_area": 1524
+    },
+    {
+      "orientation": "vertical",
+      "pixel_bbox": {
+        "x": 1,
+        "y": 745,
+        "width": 18,
+        "height": 112
+      },
+      "measured_width_mm": 156.467,
+      "assigned_width_mm": 180.0,
+      "role": "exterior",
+      "source": "IMAGE+EXTERIOR_RULE",
+      "rectangle_mm": [
+        0.0,
+        0.0,
+        180.0,
+        1010.152
+      ],
+      "pixel_area": 1975
+    }
+  ],
+  "wall_bbox_px": {
+    "x1": 183,
+    "y1": 157,
+    "x2": 1100,
+    "y2": 1013
+  }
+}

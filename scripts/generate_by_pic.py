@@ -18,10 +18,23 @@ OVERALL_WIDTH_MM = 10700.0
 OVERALL_HEIGHT_MM = 13990.0
 HORIZONTAL_CHAIN_MM = [2240.0, 3360.0, 2700.0, 1200.0, 1200.0]
 VERTICAL_CHAIN_TOP_DOWN_MM = [740.0, 3500.0, 5000.0, 3500.0, 1250.0]
+WALL_WIDTHS_MM = [240.0, 180.0, 120.0]
 
 # Verified against ref_pic_2.jpg: outermost wall-outline extents only.  The
 # dimension strings and extension lines lie outside this rectangle.
 WALL_BBOX_PX = (436, 536, 1465, 1867)
+
+
+def load_wall_widths(path: Path) -> list[float]:
+    """Load allowed wall widths, accepting the former misspelled key."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    values = data.get("wall_width", data.get("wall_wdith"))
+    if not isinstance(values, list) or not values:
+        raise ValueError(f"{path}: wall_width must be a non-empty list")
+    widths = sorted({float(value) for value in values}, reverse=True)
+    if any(value <= 0 for value in widths):
+        raise ValueError(f"{path}: wall_width values must be positive")
+    return widths
 
 
 def read_gray(path: Path) -> np.ndarray:
@@ -89,10 +102,10 @@ def snap_nearby_coordinates(values: list[int], tolerance: int = 3) -> dict[int, 
 
 
 def remove_redundant_vertices(
-    points: list[tuple[int, int]],
-) -> list[tuple[int, int]]:
+    points: list[tuple[float, float]],
+) -> list[tuple[float, float]]:
     """Remove duplicate and collinear vertices from a closed orthogonal loop."""
-    cleaned: list[tuple[int, int]] = []
+    cleaned: list[tuple[float, float]] = []
     for point in points:
         if not cleaned or point != cleaned[-1]:
             cleaned.append(point)
@@ -172,6 +185,260 @@ def estimate_wall_thickness_px(mask: np.ndarray) -> float:
     return max(1.0, float(np.percentile(positive, 90)) * 2.0)
 
 
+def dimension_wall_bands() -> tuple[list[tuple[float, float, float]], list[tuple[float, float, float]]]:
+    """Return exact X/Y wall bands explicitly present in dimension chains."""
+    allowed = set(WALL_WIDTHS_MM)
+    x_bands: list[tuple[float, float, float]] = []
+    position = 0.0
+    for value in HORIZONTAL_CHAIN_MM:
+        end = position + value
+        if value in allowed:
+            x_bands.append((position, end, value))
+        position = end
+
+    y_bands: list[tuple[float, float, float]] = []
+    top = 0.0
+    for value in VERTICAL_CHAIN_TOP_DOWN_MM:
+        bottom = top + value
+        if value in allowed:
+            y_bands.append(
+                (OVERALL_HEIGHT_MM - bottom, OVERALL_HEIGHT_MM - top, value)
+            )
+        top = bottom
+    return x_bands, y_bands
+
+
+def nearest_width(value: float, choices: list[float]) -> float:
+    return min(choices, key=lambda choice: (abs(choice - value), choice))
+
+
+def snap_rectangle_junctions(
+    rectangles: list[tuple[float, float, float, float]],
+    assignments: list[dict],
+    tolerance: float = 80.0,
+) -> list[tuple[float, float, float, float]]:
+    """Align wall-strip endpoints with the outer face of intersecting strips."""
+    adjusted = [list(rectangle) for rectangle in rectangles]
+    horizontal_indices = [
+        index
+        for index, assignment in enumerate(assignments)
+        if assignment["orientation"] == "horizontal"
+    ]
+    vertical_indices = [
+        index
+        for index, assignment in enumerate(assignments)
+        if assignment["orientation"] == "vertical"
+    ]
+    for horizontal_index in horizontal_indices:
+        hx1, hy1, hx2, hy2 = adjusted[horizontal_index]
+        for vertical_index in vertical_indices:
+            vx1, vy1, vx2, vy2 = adjusted[vertical_index]
+            if hy2 < vy1 - tolerance or hy1 > vy2 + tolerance:
+                continue
+            if vx1 - tolerance <= hx1 <= vx2 + tolerance and hx2 > vx2:
+                hx1 = vx1
+            if vx1 - tolerance <= hx2 <= vx2 + tolerance and hx1 < vx1:
+                hx2 = vx2
+            if hy1 - tolerance <= vy1 <= hy2 + tolerance and vy2 > hy2:
+                vy1 = hy1
+            if hy1 - tolerance <= vy2 <= hy2 + tolerance and vy1 < hy1:
+                vy2 = hy2
+            adjusted[vertical_index] = [vx1, vy1, vx2, vy2]
+        adjusted[horizontal_index] = [hx1, hy1, hx2, hy2]
+
+    result = [tuple(round(value, 3) for value in rectangle) for rectangle in adjusted]
+    for assignment, rectangle in zip(assignments, result):
+        assignment["rectangle_mm"] = rectangle
+    return result
+
+
+def matching_dimension_band(
+    actual_low: float,
+    actual_high: float,
+    bands: list[tuple[float, float, float]],
+    tolerance: float = 60.0,
+) -> tuple[float, float, float] | None:
+    actual_center = (actual_low + actual_high) / 2.0
+    matches = [
+        band
+        for band in bands
+        if max(actual_low, band[0]) <= min(actual_high, band[1]) + tolerance
+    ]
+    if not matches:
+        return None
+    return min(matches, key=lambda band: abs(actual_center - (band[0] + band[1]) / 2.0))
+
+
+def extract_standard_wall_rectangles(
+    roi: np.ndarray, estimated_thickness: float
+) -> tuple[list[tuple[float, float, float, float]], list[dict]]:
+    """Rebuild axis-aligned wall strips with widths selected from data.json."""
+    roi_height, roi_width = roi.shape
+    kernel_length = max(7, int(round(estimated_thickness * 2.0)))
+    x_bands, y_bands = dimension_wall_bands()
+    minimum_width = min(WALL_WIDTHS_MM)
+    exterior_widths = [value for value in WALL_WIDTHS_MM if value > minimum_width]
+    if not exterior_widths:
+        exterior_widths = WALL_WIDTHS_MM[:]
+    boundary_tolerance = max(3, int(round(estimated_thickness * 0.25)))
+    rectangles: list[tuple[float, float, float, float]] = []
+    assignments: list[dict] = []
+
+    orientations = (
+        ("horizontal", np.ones((1, kernel_length), np.uint8)),
+        ("vertical", np.ones((kernel_length, 1), np.uint8)),
+    )
+    for orientation, kernel in orientations:
+        opened = cv2.morphologyEx(roi, cv2.MORPH_OPEN, kernel)
+        count, _, stats, _ = cv2.connectedComponentsWithStats(opened, 8)
+        for index in range(1, count):
+            x, y, width, height, area = (int(value) for value in stats[index])
+            if orientation == "horizontal":
+                if width < kernel_length or height > estimated_thickness * 2.0:
+                    continue
+                cad_x1, cad_y_high = to_cad((WALL_BBOX_PX[0] + x, WALL_BBOX_PX[1] + y))
+                cad_x2, cad_y_low = to_cad(
+                    (WALL_BBOX_PX[0] + x + width - 1, WALL_BBOX_PX[1] + y + height - 1)
+                )
+                actual_low, actual_high = sorted((cad_y_low, cad_y_high))
+                measured_width = actual_high - actual_low
+                explicit = matching_dimension_band(actual_low, actual_high, y_bands)
+                touches_low = y + height - 1 >= roi_height - 1 - boundary_tolerance
+                touches_high = y <= boundary_tolerance
+                if explicit is not None:
+                    low, high, assigned_width = explicit
+                    role, source = "dimensioned", "DIMENSION_CHAIN"
+                elif touches_low:
+                    assigned_width = nearest_width(measured_width, exterior_widths)
+                    low, high = 0.0, assigned_width
+                    role, source = "exterior", "IMAGE+EXTERIOR_RULE"
+                elif touches_high:
+                    assigned_width = nearest_width(measured_width, exterior_widths)
+                    low, high = OVERALL_HEIGHT_MM - assigned_width, OVERALL_HEIGHT_MM
+                    role, source = "exterior", "IMAGE+EXTERIOR_RULE"
+                else:
+                    assigned_width = minimum_width
+                    center = (actual_low + actual_high) / 2.0
+                    low, high = center - assigned_width / 2.0, center + assigned_width / 2.0
+                    role, source = "interior", "INTERIOR_RULE"
+                rectangle = (min(cad_x1, cad_x2), low, max(cad_x1, cad_x2), high)
+            else:
+                if height < kernel_length or width > estimated_thickness * 2.0:
+                    continue
+                cad_x_low, cad_y1 = to_cad((WALL_BBOX_PX[0] + x, WALL_BBOX_PX[1] + y))
+                cad_x_high, cad_y2 = to_cad(
+                    (WALL_BBOX_PX[0] + x + width - 1, WALL_BBOX_PX[1] + y + height - 1)
+                )
+                actual_low, actual_high = sorted((cad_x_low, cad_x_high))
+                measured_width = actual_high - actual_low
+                explicit = matching_dimension_band(actual_low, actual_high, x_bands)
+                touches_low = x <= boundary_tolerance
+                touches_high = x + width - 1 >= roi_width - 1 - boundary_tolerance
+                if explicit is not None:
+                    low, high, assigned_width = explicit
+                    role, source = "dimensioned", "DIMENSION_CHAIN"
+                elif touches_low:
+                    assigned_width = nearest_width(measured_width, exterior_widths)
+                    low, high = 0.0, assigned_width
+                    role, source = "exterior", "IMAGE+EXTERIOR_RULE"
+                elif touches_high:
+                    assigned_width = nearest_width(measured_width, exterior_widths)
+                    low, high = OVERALL_WIDTH_MM - assigned_width, OVERALL_WIDTH_MM
+                    role, source = "exterior", "IMAGE+EXTERIOR_RULE"
+                else:
+                    assigned_width = minimum_width
+                    center = (actual_low + actual_high) / 2.0
+                    low, high = center - assigned_width / 2.0, center + assigned_width / 2.0
+                    role, source = "interior", "INTERIOR_RULE"
+                rectangle = (low, min(cad_y1, cad_y2), high, max(cad_y1, cad_y2))
+
+            rectangle = tuple(round(value, 3) for value in rectangle)
+            rectangles.append(rectangle)
+            assignments.append(
+                {
+                    "orientation": orientation,
+                    "pixel_bbox": {"x": x, "y": y, "width": width, "height": height},
+                    "measured_width_mm": round(measured_width, 3),
+                    "assigned_width_mm": assigned_width,
+                    "role": role,
+                    "source": source,
+                    "rectangle_mm": rectangle,
+                    "pixel_area": area,
+                }
+            )
+    rectangles = snap_rectangle_junctions(rectangles, assignments)
+    return rectangles, assignments
+
+
+def rectangles_to_closed_polylines(
+    rectangles: list[tuple[float, float, float, float]],
+) -> list[list[tuple[float, float]]]:
+    """Compute exact orthogonal union boundaries without an extra dependency."""
+    xs = sorted({value for rectangle in rectangles for value in (rectangle[0], rectangle[2])})
+    ys = sorted({value for rectangle in rectangles for value in (rectangle[1], rectangle[3])})
+    occupied = [[False for _ in range(len(ys) - 1)] for _ in range(len(xs) - 1)]
+    for i in range(len(xs) - 1):
+        center_x = (xs[i] + xs[i + 1]) / 2.0
+        for j in range(len(ys) - 1):
+            center_y = (ys[j] + ys[j + 1]) / 2.0
+            occupied[i][j] = any(
+                x1 < center_x < x2 and y1 < center_y < y2
+                for x1, y1, x2, y2 in rectangles
+            )
+
+    edges: set[tuple[tuple[float, float], tuple[float, float]]] = set()
+    for i in range(len(xs) - 1):
+        for j in range(len(ys) - 1):
+            if not occupied[i][j]:
+                continue
+            x1, x2, y1, y2 = xs[i], xs[i + 1], ys[j], ys[j + 1]
+            if j == 0 or not occupied[i][j - 1]:
+                edges.add(((x1, y1), (x2, y1)))
+            if i == len(xs) - 2 or not occupied[i + 1][j]:
+                edges.add(((x2, y1), (x2, y2)))
+            if j == len(ys) - 2 or not occupied[i][j + 1]:
+                edges.add(((x2, y2), (x1, y2)))
+            if i == 0 or not occupied[i - 1][j]:
+                edges.add(((x1, y2), (x1, y1)))
+
+    outgoing: dict[tuple[float, float], list[tuple[float, float]]] = {}
+    for start, end in edges:
+        outgoing.setdefault(start, []).append(end)
+    remaining = set(edges)
+    loops: list[list[tuple[float, float]]] = []
+    while remaining:
+        first_start, first_end = next(iter(remaining))
+        loop = [first_start]
+        previous, current = first_start, first_end
+        remaining.remove((first_start, first_end))
+        loop.append(current)
+        while current != first_start:
+            candidates = [end for end in outgoing.get(current, []) if (current, end) in remaining]
+            if not candidates:
+                raise RuntimeError(f"Open wall union boundary at {current}")
+            if len(candidates) == 1:
+                following = candidates[0]
+            else:
+                incoming = (current[0] - previous[0], current[1] - previous[1])
+                following = max(
+                    candidates,
+                    key=lambda point: (
+                        incoming[0] * (point[1] - current[1])
+                        - incoming[1] * (point[0] - current[0]),
+                        incoming[0] * (point[0] - current[0])
+                        + incoming[1] * (point[1] - current[1]),
+                    ),
+                )
+            remaining.remove((current, following))
+            previous, current = current, following
+            if current != first_start:
+                loop.append(current)
+        simplified = remove_redundant_vertices(loop)
+        if len(simplified) >= 4:
+            loops.append(simplified)
+    return loops
+
+
 def extract_closed_wall_polylines(
     roi: np.ndarray,
     x_offset: int,
@@ -216,7 +483,7 @@ def extract_closed_wall_polylines(
 def extract_wall_geometry(
     gray: np.ndarray,
 ) -> tuple[
-    list[tuple[int, int, int, int]], list[list[tuple[int, int]]], dict
+    list[tuple[int, int, int, int]], list[list[tuple[float, float]]], dict
 ]:
     x1, y1, x2, y2 = WALL_BBOX_PX
     roi = np.uint8(gray[y1 : y2 + 1, x1 : x2 + 1] < 190) * 255
@@ -231,11 +498,10 @@ def extract_wall_geometry(
     if solid_ratio >= 0.12:
         extraction_mode = "solid-wall-boundaries"
         estimated_thickness = estimate_wall_thickness_px(roi)
-        max_tab_depth = max(3, int(round(estimated_thickness * 0.75)))
-        max_tab_width = max(6, int(round(estimated_thickness * 1.6)))
-        polylines = extract_closed_wall_polylines(
-            roi, x1, y1, max_tab_depth, max_tab_width
+        rectangles, assignments = extract_standard_wall_rectangles(
+            roi, estimated_thickness
         )
+        polylines = rectangles_to_closed_polylines(rectangles)
         return [], polylines, {
             "horizontal_boundary_lines": 0,
             "vertical_boundary_lines": 0,
@@ -244,8 +510,8 @@ def extract_wall_geometry(
             "extraction_mode": extraction_mode,
             "solid_wall_ratio": round(float(solid_ratio), 4),
             "estimated_wall_thickness_px": round(estimated_thickness, 2),
-            "tab_cleanup_max_depth_px": max_tab_depth,
-            "tab_cleanup_max_width_px": max_tab_width,
+            "wall_width_candidates_mm": WALL_WIDTHS_MM,
+            "wall_width_assignments": assignments,
             "wall_bbox_px": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
         }
     else:
@@ -365,7 +631,7 @@ def add_dimensions(msp, dimstyle: str) -> None:
 def write_preview(
     path: Path,
     lines: list[tuple[int, int, int, int]],
-    polylines: list[list[tuple[int, int]]],
+    polylines: list[list[tuple[float, float]]],
     width: int = 1200,
 ) -> None:
     margin = 100
@@ -380,7 +646,7 @@ def write_preview(
         b = (margin + p2[0] * scale, height - margin - p2[1] * scale)
         draw.line((a, b), fill="black", width=2)
     for polyline in polylines:
-        cad_points = [to_cad(point) for point in polyline]
+        cad_points = polyline
         image_points = [
             (margin + x * scale, height - margin - y * scale)
             for x, y in cad_points
@@ -406,7 +672,7 @@ def generate(source: Path, output: Path) -> dict:
         msp.add_line(to_cad((x1, y1)), to_cad((x2, y2)), dxfattribs={"layer": "WALLS"})
     for polyline in polylines:
         msp.add_lwpolyline(
-            [to_cad(point) for point in polyline],
+            polyline,
             close=True,
             dxfattribs={"layer": "WALLS"},
         )
@@ -440,10 +706,16 @@ def generate(source: Path, output: Path) -> dict:
 
 def main() -> int:
     global OVERALL_WIDTH_MM, OVERALL_HEIGHT_MM, HORIZONTAL_CHAIN_MM
-    global VERTICAL_CHAIN_TOP_DOWN_MM, WALL_BBOX_PX
+    global VERTICAL_CHAIN_TOP_DOWN_MM, WALL_BBOX_PX, WALL_WIDTHS_MM
     parser = argparse.ArgumentParser(description="从 ref_pic_2 生成仅含墙体和尺寸的 DXF")
     parser.add_argument("source", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument(
+        "--data",
+        type=Path,
+        default=Path(__file__).with_name("data.json"),
+        help="JSON config containing wall_width candidates in millimetres",
+    )
     parser.add_argument("--overall-width-mm", type=float, default=OVERALL_WIDTH_MM)
     parser.add_argument("--overall-height-mm", type=float, default=OVERALL_HEIGHT_MM)
     parser.add_argument(
@@ -476,6 +748,7 @@ def main() -> int:
     HORIZONTAL_CHAIN_MM = list(args.horizontal_chain_mm)
     VERTICAL_CHAIN_TOP_DOWN_MM = list(args.vertical_chain_top_down_mm)
     WALL_BBOX_PX = tuple(args.wall_bbox)
+    WALL_WIDTHS_MM = load_wall_widths(args.data)
     if abs(sum(HORIZONTAL_CHAIN_MM) - OVERALL_WIDTH_MM) > 0.01:
         parser.error("横向尺寸链之和必须等于 overall-width-mm")
     if abs(sum(VERTICAL_CHAIN_TOP_DOWN_MM) - OVERALL_HEIGHT_MM) > 0.01:
