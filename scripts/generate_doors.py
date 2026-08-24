@@ -848,6 +848,86 @@ def cad_leaf_angles(leaf: PixelLeaf) -> tuple[float, float, float]:
     return float(cad_start), float(cad_end), float(leaf_angle)
 
 
+def _cross(a, b, c):
+    return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+
+def _distance(a, b):
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def _segment_intersection(a, b, c, d, tolerance=1.0):
+    """返回交点及是否为明显共线重叠。"""
+    rx, ry = b[0] - a[0], b[1] - a[1]
+    sx, sy = d[0] - c[0], d[1] - c[1]
+    den = rx * sy - ry * sx
+    if abs(den) <= 1e-9:
+        if abs(_cross(a, b, c)) > tolerance:
+            return [], False
+        norm = max(math.hypot(rx, ry), 1.0)
+        denom = rx * rx + ry * ry
+        t0 = ((c[0] - a[0]) * rx + (c[1] - a[1]) * ry) / denom
+        t1 = ((d[0] - a[0]) * rx + (d[1] - a[1]) * ry) / denom
+        param_tol = tolerance / norm
+        lo, hi = max(0.0, min(t0, t1)), min(1.0, max(t0, t1))
+        if hi < lo - param_tol:
+            return [], False
+        point = (a[0] + ((lo + hi) / 2.0) * rx, a[1] + ((lo + hi) / 2.0) * ry)
+        return [point], hi - lo > param_tol
+    qpx, qpy = c[0] - a[0], c[1] - a[1]
+    t = (qpx * sy - qpy * sx) / den
+    u = (qpx * ry - qpy * rx) / den
+    t_tol = tolerance / max(math.hypot(rx, ry), 1.0)
+    u_tol = tolerance / max(math.hypot(sx, sy), 1.0)
+    if -t_tol <= t <= 1.0 + t_tol and -u_tol <= u <= 1.0 + u_tol:
+        return [(a[0] + t * rx, a[1] + t * ry)], False
+    return [], False
+
+
+def _entity_segments(entity):
+    kind = entity.dxftype()
+    if kind == "LINE":
+        return [((float(entity.dxf.start.x), float(entity.dxf.start.y)), (float(entity.dxf.end.x), float(entity.dxf.end.y)))]
+    if kind == "ARC":
+        start, end = float(entity.dxf.start_angle), float(entity.dxf.end_angle)
+        while end <= start:
+            end += 360.0
+        steps = max(12, int(abs(end - start) / 5.0))
+        angles = np.linspace(start, end, steps + 1)
+        center = (float(entity.dxf.center.x), float(entity.dxf.center.y))
+        radius = float(entity.dxf.radius)
+        points = [(center[0] + radius * math.cos(math.radians(a)), center[1] + radius * math.sin(math.radians(a))) for a in angles]
+        return list(zip(points, points[1:]))
+    if kind == "LWPOLYLINE":
+        points = [(float(x), float(y)) for x, y in entity.get_points("xy")]
+        if len(points) < 2:
+            return []
+        if entity.closed:
+            points.append(points[0])
+        return list(zip(points, points[1:]))
+    return []
+
+
+def validate_door_geometry(msp, tolerance: float = 2.0) -> list[dict]:
+    """检查 DOORS 的直线/弧线/多段线是否穿入墙体或窗线。"""
+    targets = [e for e in msp if e.dxftype() in {"LINE", "LWPOLYLINE"} and e.dxf.layer in WALL_LAYERS | {WINDOW_LAYER}]
+    collisions = []
+    for door_entity in msp:
+        if door_entity.dxf.layer != DOOR_LAYER or door_entity.dxftype() not in {"LINE", "ARC", "LWPOLYLINE"}:
+            continue
+        for da, db in _entity_segments(door_entity):
+            for target in targets:
+                target_layer = target.dxf.layer
+                for ta, tb in _entity_segments(target):
+                    points, collinear = _segment_intersection(da, db, ta, tb, tolerance)
+                    for point in points:
+                        endpoint_contact = _distance(point, da) <= tolerance * 1.5 or _distance(point, db) <= tolerance * 1.5
+                        if target_layer in WALL_LAYERS and endpoint_contact and not collinear:
+                            continue
+                        collisions.append({"door_handle": door_entity.dxf.handle, "door_type": door_entity.dxftype(), "target_layer": target_layer, "target_type": target.dxftype(), "point": [round(point[0], 3), round(point[1], 3)], "collinear_overlap": bool(collinear)})
+    return collisions
+
+
 def add_swing_geometry(
     msp,
     door: CadDoor,
@@ -860,22 +940,22 @@ def add_swing_geometry(
     for leaf in pixel.leaves:
         mapped_x = pixel_to_cad_x(leaf.center_x, bbox, overall_width_mm)
         mapped_y = pixel_to_cad_y(leaf.center_y, bbox, overall_height_mm)
+        arc_start, arc_end, leaf_angle = cad_leaf_angles(leaf)
         if door.orientation == "horizontal":
             hinge_x = min((door.start, door.end), key=lambda value: abs(value - mapped_x))
             hinge_y = (
                 min((door.face1, door.face2), key=lambda value: abs(value - mapped_y))
                 if door.kind == "swing_double"
-                else (door.face1 + door.face2) / 2.0
+                else (door.face2 if math.sin(math.radians(leaf_angle)) > 0 else door.face1)
             )
         else:
             hinge_y = min((door.start, door.end), key=lambda value: abs(value - mapped_y))
             hinge_x = (
                 min((door.face1, door.face2), key=lambda value: abs(value - mapped_x))
                 if door.kind == "swing_double"
-                else (door.face1 + door.face2) / 2.0
+                else (door.face1 if math.cos(math.radians(leaf_angle)) < 0 else door.face2)
             )
         radius = door.opening_width
-        arc_start, arc_end, leaf_angle = cad_leaf_angles(leaf)
         leaf_end = (
             hinge_x + radius * math.cos(math.radians(leaf_angle)),
             hinge_y + radius * math.sin(math.radians(leaf_angle)),
@@ -1131,6 +1211,10 @@ def generate(
     final_overlaps = sum(count_wall_overlaps(msp, door) for door in accepted)
     if final_overlaps:
         raise RuntimeError(f"闭合墙体重建后门洞内仍有 {final_overlaps} 条墙体边界")
+    door_geometry_collisions = validate_door_geometry(msp)
+    if door_geometry_collisions:
+        sample = door_geometry_collisions[:3]
+        raise RuntimeError(f"门线与墙体或窗线相交（共 {len(door_geometry_collisions)} 处），示例：{sample}")
     output.parent.mkdir(parents=True, exist_ok=True)
     doc.saveas(output)
     auditor = doc.audit()
@@ -1158,6 +1242,8 @@ def generate(
             "door_lines": sum(1 for entity in msp if entity.dxftype() == "LINE" and entity.dxf.layer == DOOR_LAYER),
             "door_arcs": sum(1 for entity in msp if entity.dxftype() == "ARC" and entity.dxf.layer == DOOR_LAYER),
             "closed_sliding_panels": sum(1 for entity in msp if entity.dxftype() == "LWPOLYLINE" and entity.dxf.layer == DOOR_LAYER and entity.closed),
+            "door_geometry_collisions": door_geometry_collisions,
+            "door_geometry_collision_count": len(door_geometry_collisions),
         },
         "audit_errors": len(auditor.errors),
         "audit_fixes": len(auditor.fixes),
