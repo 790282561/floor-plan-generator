@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a wall-only DXF from the checked ref_pic_2 CAD raster export."""
+"""Generate a wall-only DXF from a calibrated floor-plan raster image."""
 
 from __future__ import annotations
 
@@ -73,16 +73,190 @@ def merge_axis_segments(
     return sorted(merged)
 
 
-def extract_axis_lines(gray: np.ndarray) -> tuple[list[tuple[int, int, int, int]], dict]:
+def snap_nearby_coordinates(values: list[int], tolerance: int = 3) -> dict[int, int]:
+    """Map near-identical raster coordinates to one stable grid coordinate."""
+    groups: list[list[int]] = []
+    for value in sorted(set(values)):
+        if not groups or value - round(sum(groups[-1]) / len(groups[-1])) > tolerance:
+            groups.append([value])
+        else:
+            groups[-1].append(value)
+    mapping: dict[int, int] = {}
+    for group in groups:
+        target = int(round(float(np.median(group))))
+        mapping.update({value: target for value in group})
+    return mapping
+
+
+def remove_redundant_vertices(
+    points: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    """Remove duplicate and collinear vertices from a closed orthogonal loop."""
+    cleaned: list[tuple[int, int]] = []
+    for point in points:
+        if not cleaned or point != cleaned[-1]:
+            cleaned.append(point)
+    if len(cleaned) > 1 and cleaned[0] == cleaned[-1]:
+        cleaned.pop()
+
+    changed = True
+    while changed and len(cleaned) >= 4:
+        changed = False
+        result: list[tuple[int, int]] = []
+        count = len(cleaned)
+        for index, point in enumerate(cleaned):
+            previous = cleaned[(index - 1) % count]
+            following = cleaned[(index + 1) % count]
+            if (
+                previous[0] == point[0] == following[0]
+                or previous[1] == point[1] == following[1]
+            ):
+                changed = True
+                continue
+            result.append(point)
+        cleaned = result
+    return cleaned
+
+
+def remove_short_rectangular_tabs(
+    points: list[tuple[int, int]], max_depth: int, max_width: int
+) -> list[tuple[int, int]]:
+    """Flatten short rectangular contour detours caused by wall-line overrun."""
+    cleaned = points[:]
+    changed = True
+    while changed and len(cleaned) >= 6:
+        changed = False
+        count = len(cleaned)
+        for index in range(count):
+            b_index = index
+            c_index = (index + 1) % count
+            d_index = (index + 2) % count
+            e_index = (index + 3) % count
+            b, c, d, e = (
+                cleaned[b_index],
+                cleaned[c_index],
+                cleaned[d_index],
+                cleaned[e_index],
+            )
+            horizontal_tab = (
+                b[1] == e[1]
+                and c[1] == d[1]
+                and b[0] == c[0]
+                and d[0] == e[0]
+                and 0 < abs(c[1] - b[1]) <= max_depth
+                and 0 < abs(d[0] - c[0]) <= max_width
+            )
+            vertical_tab = (
+                b[0] == e[0]
+                and c[0] == d[0]
+                and b[1] == c[1]
+                and d[1] == e[1]
+                and 0 < abs(c[0] - b[0]) <= max_depth
+                and 0 < abs(d[1] - c[1]) <= max_width
+            )
+            if horizontal_tab or vertical_tab:
+                for remove_index in sorted({c_index, d_index}, reverse=True):
+                    cleaned.pop(remove_index)
+                cleaned = remove_redundant_vertices(cleaned)
+                changed = True
+                break
+    return cleaned
+
+
+def estimate_wall_thickness_px(mask: np.ndarray) -> float:
+    """Estimate the common solid-strip thickness from the distance field."""
+    distance = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+    positive = distance[distance > 0]
+    if positive.size == 0:
+        return 1.0
+    return max(1.0, float(np.percentile(positive, 90)) * 2.0)
+
+
+def extract_closed_wall_polylines(
+    roi: np.ndarray,
+    x_offset: int,
+    y_offset: int,
+    max_tab_depth: int,
+    max_tab_width: int,
+) -> list[list[tuple[int, int]]]:
+    """Trace solid wall regions as closed, snapped orthogonal boundaries."""
+    # Heal threshold/anti-alias pinholes only. The 3 px kernel is much smaller
+    # than a wall opening, so intentional openings remain open.
+    clean = cv2.morphologyEx(
+        roi, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8)
+    )
+    contours, _ = cv2.findContours(clean, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    raw_polylines: list[list[tuple[int, int]]] = []
+    for contour in contours:
+        if abs(cv2.contourArea(contour)) < 20:
+            continue
+        simplified = cv2.approxPolyDP(contour, 2.0, True).reshape(-1, 2)
+        points = [(int(x) + x_offset, int(y) + y_offset) for x, y in simplified]
+        if len(points) >= 4:
+            raw_polylines.append(points)
+
+    x_map = snap_nearby_coordinates(
+        [point[0] for polygon in raw_polylines for point in polygon]
+    )
+    y_map = snap_nearby_coordinates(
+        [point[1] for polygon in raw_polylines for point in polygon]
+    )
+    polylines: list[list[tuple[int, int]]] = []
+    for polygon in raw_polylines:
+        snapped = [(x_map[x], y_map[y]) for x, y in polygon]
+        cleaned = remove_redundant_vertices(snapped)
+        cleaned = remove_short_rectangular_tabs(
+            cleaned, max_depth=max_tab_depth, max_width=max_tab_width
+        )
+        if len(cleaned) >= 4:
+            polylines.append(cleaned)
+    return polylines
+
+
+def extract_wall_geometry(
+    gray: np.ndarray,
+) -> tuple[
+    list[tuple[int, int, int, int]], list[list[tuple[int, int]]], dict
+]:
     x1, y1, x2, y2 = WALL_BBOX_PX
     roi = np.uint8(gray[y1 : y2 + 1, x1 : x2 + 1] < 190) * 255
     roi = keep_wall_components(roi)
 
+    # CAD exports arrive in two common forms: thin outline linework and solid
+    # black wall strips.  Erosion removes thin strokes but preserves the core
+    # of solid strips, which provides a stable automatic mode switch.
+    ink_pixels = int(np.count_nonzero(roi))
+    eroded = cv2.erode(roi, np.ones((5, 5), np.uint8))
+    solid_ratio = np.count_nonzero(eroded) / max(ink_pixels, 1)
+    if solid_ratio >= 0.12:
+        extraction_mode = "solid-wall-boundaries"
+        estimated_thickness = estimate_wall_thickness_px(roi)
+        max_tab_depth = max(3, int(round(estimated_thickness * 0.75)))
+        max_tab_width = max(6, int(round(estimated_thickness * 1.6)))
+        polylines = extract_closed_wall_polylines(
+            roi, x1, y1, max_tab_depth, max_tab_width
+        )
+        return [], polylines, {
+            "horizontal_boundary_lines": 0,
+            "vertical_boundary_lines": 0,
+            "closed_wall_polylines": len(polylines),
+            "closed_wall_boundary_edges": sum(len(polyline) for polyline in polylines),
+            "extraction_mode": extraction_mode,
+            "solid_wall_ratio": round(float(solid_ratio), 4),
+            "estimated_wall_thickness_px": round(estimated_thickness, 2),
+            "tab_cleanup_max_depth_px": max_tab_depth,
+            "tab_cleanup_max_width_px": max_tab_width,
+            "wall_bbox_px": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
+        }
+    else:
+        extraction_mode = "thin-outline-lines"
+        line_source = roi
+
     horizontal_mask = cv2.morphologyEx(
-        roi, cv2.MORPH_OPEN, np.ones((1, 7), np.uint8)
+        line_source, cv2.MORPH_OPEN, np.ones((1, 7), np.uint8)
     )
     vertical_mask = cv2.morphologyEx(
-        roi, cv2.MORPH_OPEN, np.ones((7, 1), np.uint8)
+        line_source, cv2.MORPH_OPEN, np.ones((7, 1), np.uint8)
     )
 
     horizontal: list[tuple[int, int, int]] = []
@@ -103,9 +277,11 @@ def extract_axis_lines(gray: np.ndarray) -> tuple[list[tuple[int, int, int, int]
     vertical = merge_axis_segments(vertical)
     lines = [(start, axis, end, axis) for axis, start, end in horizontal]
     lines.extend((axis, start, axis, end) for axis, start, end in vertical)
-    return lines, {
+    return lines, [], {
         "horizontal_boundary_lines": len(horizontal),
         "vertical_boundary_lines": len(vertical),
+        "extraction_mode": extraction_mode,
+        "solid_wall_ratio": round(float(solid_ratio), 4),
         "wall_bbox_px": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
     }
 
@@ -187,7 +363,10 @@ def add_dimensions(msp, dimstyle: str) -> None:
 
 
 def write_preview(
-    path: Path, lines: list[tuple[int, int, int, int]], width: int = 1200
+    path: Path,
+    lines: list[tuple[int, int, int, int]],
+    polylines: list[list[tuple[int, int]]],
+    width: int = 1200,
 ) -> None:
     margin = 100
     scale = (width - margin * 2) / OVERALL_WIDTH_MM
@@ -200,14 +379,21 @@ def write_preview(
         a = (margin + p1[0] * scale, height - margin - p1[1] * scale)
         b = (margin + p2[0] * scale, height - margin - p2[1] * scale)
         draw.line((a, b), fill="black", width=2)
+    for polyline in polylines:
+        cad_points = [to_cad(point) for point in polyline]
+        image_points = [
+            (margin + x * scale, height - margin - y * scale)
+            for x, y in cad_points
+        ]
+        draw.line(image_points + [image_points[0]], fill="black", width=2)
     path.parent.mkdir(parents=True, exist_ok=True)
     image.save(path)
 
 
 def generate(source: Path, output: Path) -> dict:
     gray = read_gray(source)
-    lines, stats = extract_axis_lines(gray)
-    if not lines:
+    lines, polylines, stats = extract_wall_geometry(gray)
+    if not lines and not polylines:
         raise RuntimeError("未提取到墙体边界线")
 
     doc = ezdxf.new("R2010", setup=True)
@@ -218,6 +404,12 @@ def generate(source: Path, output: Path) -> dict:
     msp = doc.modelspace()
     for x1, y1, x2, y2 in lines:
         msp.add_line(to_cad((x1, y1)), to_cad((x2, y2)), dxfattribs={"layer": "WALLS"})
+    for polyline in polylines:
+        msp.add_lwpolyline(
+            [to_cad(point) for point in polyline],
+            close=True,
+            dxfattribs={"layer": "WALLS"},
+        )
 
     add_dimensions(msp, add_dimension_style(doc))
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -232,6 +424,9 @@ def generate(source: Path, output: Path) -> dict:
         "horizontal_chain_mm": HORIZONTAL_CHAIN_MM,
         "vertical_chain_top_down_mm": VERTICAL_CHAIN_TOP_DOWN_MM,
         "wall_boundary_lines": len(lines),
+        "wall_closed_polylines": len(polylines),
+        "wall_boundary_edges": len(lines) + sum(len(polyline) for polyline in polylines),
+        "wall_topology": "closed-polylines" if polylines else "independent-lines",
         "audit_errors": len(auditor.errors),
         "audit_fixes": len(auditor.fixes),
         **stats,
@@ -239,7 +434,7 @@ def generate(source: Path, output: Path) -> dict:
     output.with_suffix(".json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    write_preview(output.with_suffix(".png"), lines)
+    write_preview(output.with_suffix(".png"), lines, polylines)
     return report
 
 
