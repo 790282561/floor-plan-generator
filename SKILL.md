@@ -42,7 +42,7 @@ description: 先生成并校准户型墙体，再根据户型图片识别窗户�
 
 ## 窗户阶段
 
-窗户阶段的全部识别、几何计算、墙洞切割、窗框生成和窗户校验逻辑，统一写入 `scripts/generate_windows.py`。不得把窗户逻辑继续写入 `generate_by_pic.py` 或其他脚本；`generate_by_pic.py` 只负责墙体及墙体尺寸。
+窗户阶段的全部识别、几何计算、墙洞切割、窗框生成和窗户校验逻辑，统一写入 `scripts/generate_doors.py`。虽然文件名含有 `doors`，但按当前项目约定，该文件是窗户阶段的唯一实现入口。不得把窗户逻辑继续写入 `generate_windows.py`、`generate_by_pic.py` 或其他脚本；`generate_by_pic.py` 只负责墙体及墙体尺寸。
 
 对每个接受的窗户候选，必须判断：所属墙体、水平或竖直方向、沿墙方向的开洞中心和净宽、穿墙方向的深度、窗户形状、置信度以及来源（`USER`、`DETECTED` 或 `INFERRED`）。
 
@@ -64,7 +64,7 @@ description: 先生成并校准户型墙体，再根据户型图片识别窗户�
 
 图片输入必须先运行 `scripts/processing.py`，并将预处理结果保存在输出目录附近。墙体-only 模式可以不生成窗户；带窗户的阶段必须使用显式选项（例如 `--with-windows`），不能让旧的墙体-only 任务隐式生成窗户。
 
-带窗户任务的唯一生成脚本入口为 `scripts/generate_windows.py`。该脚本应读取已完成的墙体结果以及 `processing.py` 输出的窗户候选，在墙体基础上完成窗洞和窗框生成。
+带窗户任务的唯一生成脚本入口为 `scripts/generate_doors.py`。该脚本应读取已完成的墙体结果以及 `processing.py` 输出的窗户候选，在墙体基础上完成窗洞和窗框生成。
 
 带窗户的结果应包含 `WALLS`、`INNER_WALLS`、`DIMENSIONS` 和 `WINDOWS` 图层。本阶段不得新增 `DOORS`、`ROOM_NAMES` 或其他构件图层。
 
