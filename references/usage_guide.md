@@ -33,25 +33,25 @@ AI助手会自动调用技能生成CAD文件。
 ### 1. 使用默认配置生成
 
 ```bash
-python "C:\Users\Administrator\.codebuddy\skills\floor-plan-generator\scripts\generate.py"
+python "C:\Users\Administrator\.codex\skills\floor-plan-generator\scripts\generate_by_txt.py"
 ```
 
 ### 2. 使用配置文件生成
 
 ```bash
-python "C:\Users\Administrator\.codebuddy\skills\floor-plan-generator\scripts\generate.py" --config my_config.json
+python "C:\Users\Administrator\.codex\skills\floor-plan-generator\scripts\generate_by_txt.py" --config my_config.json
 ```
 
 ### 3. 交互式生成
 
 ```bash
-python "C:\Users\Administrator\.codebuddy\skills\floor-plan-generator\scripts\generate.py" --interactive
+python "C:\Users\Administrator\.codex\skills\floor-plan-generator\scripts\generate_by_txt.py" --interactive
 ```
 
 ### 4. 指定输出文件名
 
 ```bash
-python "C:\Users\Administrator\.codebuddy\skills\floor-plan-generator\scripts\generate.py" --output "我的户型图.dwg"
+python "C:\Users\Administrator\.codex\skills\floor-plan-generator\scripts\generate_by_txt.py" --output "我的户型图.dwg"
 ```
 
 ---

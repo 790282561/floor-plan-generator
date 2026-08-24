@@ -3,9 +3,9 @@
 根据房间尺寸参数直接在当前 CAD 活跃文档中生成户型线稿
 
 使用方法:
-1. 命令行: python generate.py --config config.json
-2. 交互式: python generate.py --interactive
-3. Python API: from generate import FloorPlanGenerator, FloorPlanConfig
+1. 命令行: python generate_by_txt.py --config config.json
+2. 交互式: python generate_by_txt.py --interactive
+3. Python API: from generate_by_txt import FloorPlanGenerator, FloorPlanConfig
 
 要求: 运行前已打开 AutoCAD (或兼容 CAD) 并有一个图形文档。
 脚本不生成 DXF/DWG 文件，所有图元直接绘制到当前活跃文档的模型空间。
