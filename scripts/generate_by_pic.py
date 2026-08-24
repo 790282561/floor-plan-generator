@@ -541,11 +541,31 @@ def extract_wall_geometry(
 
     horizontal = merge_axis_segments(horizontal)
     vertical = merge_axis_segments(vertical)
-    lines = [(start, axis, end, axis) for axis, start, end in horizontal]
-    lines.extend((axis, start, axis, end) for axis, start, end in vertical)
-    return lines, [], {
+
+    # Thin-outline drawings used to be emitted as independent LINE entities.
+    # That breaks the wall-topology contract and leaves later opening stages to
+    # guess which edges belong together. Trace the detected wall ink into
+    # closed orthogonal boundaries here instead. If no closed boundary can be
+    # reconstructed, stop rather than writing a structurally invalid wall DXF.
+    traced = extract_closed_wall_polylines(
+        roi,
+        x_offset=x1,
+        y_offset=y1,
+        max_tab_depth=max(3, int(round(min(roi.shape) * 0.006))),
+        max_tab_width=max(12, int(round(min(roi.shape) * 0.03))),
+    )
+    polylines = [
+        [to_cad(point) for point in polygon]
+        for polygon in traced
+        if len(polygon) >= 4
+    ]
+    if not polylines:
+        raise RuntimeError("细线墙体无法重建为闭合 LWPOLYLINE，已停止输出")
+    return [], polylines, {
         "horizontal_boundary_lines": len(horizontal),
         "vertical_boundary_lines": len(vertical),
+        "closed_wall_polylines": len(polylines),
+        "closed_wall_boundary_edges": sum(len(polyline) for polyline in polylines),
         "extraction_mode": extraction_mode,
         "solid_wall_ratio": round(float(solid_ratio), 4),
         "wall_bbox_px": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
@@ -659,8 +679,10 @@ def write_preview(
 def generate(source: Path, output: Path) -> dict:
     gray = read_gray(source)
     lines, polylines, stats = extract_wall_geometry(gray)
-    if not lines and not polylines:
-        raise RuntimeError("未提取到墙体边界线")
+    if lines:
+        raise RuntimeError("墙体重建后仍存在独立 LINE，已停止输出")
+    if not polylines:
+        raise RuntimeError("未提取到闭合墙体多段线")
 
     doc = ezdxf.new("R2010", setup=True)
     doc.units = ezdxf.units.MM
@@ -668,8 +690,6 @@ def generate(source: Path, output: Path) -> dict:
     doc.layers.add("INNER_WALLS", color=7, linetype="CONTINUOUS")
     doc.layers.add("DIMENSIONS", color=1, linetype="CONTINUOUS")
     msp = doc.modelspace()
-    for x1, y1, x2, y2 in lines:
-        msp.add_line(to_cad((x1, y1)), to_cad((x2, y2)), dxfattribs={"layer": "WALLS"})
     for polyline in polylines:
         msp.add_lwpolyline(
             polyline,
@@ -678,10 +698,42 @@ def generate(source: Path, output: Path) -> dict:
         )
 
     add_dimensions(msp, add_dimension_style(doc))
+    auditor = doc.audit()
+    wall_lines = sum(
+        1
+        for entity in msp
+        if entity.dxf.layer in {"WALLS", "INNER_WALLS"}
+        and entity.dxftype() == "LINE"
+    )
+    open_wall_polylines = sum(
+        1
+        for entity in msp
+        if entity.dxf.layer in {"WALLS", "INNER_WALLS"}
+        and entity.dxftype() == "LWPOLYLINE"
+        and not entity.closed
+    )
+    closed_wall_polylines = sum(
+        1
+        for entity in msp
+        if entity.dxf.layer in {"WALLS", "INNER_WALLS"}
+        and entity.dxftype() == "LWPOLYLINE"
+        and entity.closed
+    )
+    wall_geometry_valid = (
+        wall_lines == 0
+        and open_wall_polylines == 0
+        and closed_wall_polylines > 0
+        and len(auditor.errors) == 0
+    )
+    if not wall_geometry_valid:
+        raise RuntimeError(
+            "墙体闭合校核失败："
+            f"LINE={wall_lines}, OPEN_LWPOLYLINE={open_wall_polylines}, "
+            f"CLOSED_LWPOLYLINE={closed_wall_polylines}, AUDIT_ERRORS={len(auditor.errors)}"
+        )
+
     output.parent.mkdir(parents=True, exist_ok=True)
     doc.saveas(output)
-
-    auditor = doc.audit()
     report = {
         "source": str(source.resolve()),
         "output": str(output.resolve()),
@@ -689,10 +741,12 @@ def generate(source: Path, output: Path) -> dict:
         "overall_height_mm": OVERALL_HEIGHT_MM,
         "horizontal_chain_mm": HORIZONTAL_CHAIN_MM,
         "vertical_chain_top_down_mm": VERTICAL_CHAIN_TOP_DOWN_MM,
-        "wall_boundary_lines": len(lines),
-        "wall_closed_polylines": len(polylines),
-        "wall_boundary_edges": len(lines) + sum(len(polyline) for polyline in polylines),
-        "wall_topology": "closed-polylines" if polylines else "independent-lines",
+        "wall_boundary_lines": wall_lines,
+        "wall_open_polylines": open_wall_polylines,
+        "wall_closed_polylines": closed_wall_polylines,
+        "wall_boundary_edges": sum(len(polyline) for polyline in polylines),
+        "wall_topology": "closed-lwpolylines",
+        "wall_geometry_valid": wall_geometry_valid,
         "audit_errors": len(auditor.errors),
         "audit_fixes": len(auditor.fixes),
         **stats,

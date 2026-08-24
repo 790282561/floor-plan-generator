@@ -1,19 +1,19 @@
 ---
 name: floor-plan-generator
-description: 根据户型图片或房间尺寸识别并生成具有真实墙厚的墙体、窗洞窗框、门洞门扇及开启方向，并输出 CAD 图纸和必要标注。
+description: 根据户型图片分阶段识别并生成具有真实墙厚的墙体、窗洞窗框、门洞门扇及开启方向，并输出 CAD 图纸和必要标注。
 ---
 
 # 建筑户型平面图生成 Skill
 
 ## 1. Skill目标
 ### 1.1 首要目标
-根据户型图片、草图、CAD 截图或文字尺寸，识别建筑外轮廓、墙体、房间、门、窗和尺寸，建立统一毫米坐标模型，生成可编辑的建筑平面图。
+根据户型图片、草图或 CAD 截图，识别建筑外轮廓、墙体、房间、门、窗和尺寸，建立统一毫米坐标模型，生成可编辑的建筑平面图。
 所有墙体必须使用具有实际厚度的双线表达；门窗必须形成真实墙体洞口，不得只将符号叠加在连续墙线上。
 ### 1.2 适用范围
 适用于户型图重绘、草图规范化、墙体拓扑重建、窗洞窗框生成、门洞门扇及开启弧生成、房间标注、尺寸标注和 CAD 输出。
 
 ### 1.3 脚本调用总原则
-图形生成必须严格调用当前项目 `scripts` 目录中的实际程序，不得自行替换为不存在的脚本或绕过脚本直接猜画。图片任务必须先调用 `processing.py`，墙体任务调用 `generate_by_pic.py`，文字尺寸任务调用 `generate_by_txt.py`，窗户任务调用 `generate_windows.py`，门任务调用 `generate_doors.py`。
+图形生成必须严格调用当前项目 `scripts` 目录中的实际程序，不得自行替换为不存在的脚本或绕过脚本直接猜画。图片任务必须依次调用 `processing.py`、`generate_by_pic.py`、`generate_windows.py` 和 `generate_doors.py`。
 
 ## 2. 强制执行流程
 ### 2.1 输入解析与图片预处理
@@ -44,12 +44,15 @@ description: 根据户型图片或房间尺寸识别并生成具有真实墙厚�
 校核外轮廓、墙体连续性、墙厚、房间闭合性、门窗位置、洞口关系、开启方向、比例和交通关系。
 ### 2.13 生成结构化数据
 生成 Wall、Opening、Door、Window、Room 和 UncertainObject 数据。用户要求优先于图片明确尺寸，图片明确尺寸优先于几何推定。
-### 2.14 CAD MCP绘制
-不得直接由 Skill 手工绘制图形，必须按任务类型调用对应脚本：图片墙体调用 `generate_by_pic.py`，文字尺寸调用 `generate_by_txt.py`，窗户调用 `generate_windows.py`，门调用 `generate_doors.py`。各脚本的输出必须作为下一脚本的输入。
+### 2.14 脚本驱动的 CAD 生成
+不得直接由 Skill 手工绘制图形，必须按图片阶段调用对应脚本：预处理调用 `processing.py`，墙体调用 `generate_by_pic.py`，窗户调用 `generate_windows.py`，门调用 `generate_doors.py`。各阶段的 DXF 输出必须作为下一阶段的输入。
 ### 2.15 绘后检查
-检查双线墙、墙厚、墙体连接、门窗是否位于墙上、门窗洞口是否真实断开、房间是否闭合、尺寸比例是否正确，以及是否存在重叠和悬空。
+每个生成脚本都必须读取其输出的同名 JSON 报告并完成阶段验收：墙体阶段确认 `wall_geometry_valid == true`、`wall_boundary_lines == 0`、`wall_open_polylines == 0`、`wall_closed_polylines > 0` 且 `audit_errors == 0`；窗户阶段确认 `accepted_windows > 0`、`topology.wall_overlaps_after == 0` 且 `audit_errors == 0`；门阶段确认 `accepted_doors > 0`、`topology.wall_overlaps_after == 0`、`topology.door_geometry_collision_count == 0` 且 `audit_errors == 0`。任一条件不满足时停止，不得进入下一阶段。静态验收通过后仍需检查 PNG 预览和目标 CAD 实际显示。
 ### 2.16 局部纠错
 只修改对应局部对象，并重新检查相邻墙体、门窗、房间和尺寸关系。不得因局部纠错改变无关区域。
+
+### 2.17 预处理证据的使用边界
+`processing.py` 生成的 `result.json`、`overlay.png` 和 masks 是识别证据与审计记录，不是门窗几何的直接输入。窗户位置和几何必须由 `generate_windows.py` 根据图片和墙体 DXF 重新计算；门的位置、门型和开启方向必须由 `generate_doors.py` 根据当前含门图片、上一阶段图片和墙窗 DXF 重新计算。不得把 `result.json` 中的候选框直接转换为 CAD 门窗。
 
 ## 3. 数据模型
 ### 3.1 Wall
@@ -67,7 +70,7 @@ description: 根据户型图片或房间尺寸识别并生成具有真实墙厚�
 
 ## 4. 信息可信度
 ### 4.1 USER
-用户明确提供的墙厚、房间尺寸、门窗尺寸或布局关系，优先级最高。
+用户明确提供的墙厚、图片校准尺寸、门窗尺寸或布局关系，优先级最高。
 ### 4.2 DETECTED
 从图片中明确识别出的墙体、门窗、房间文字、尺寸和几何关系。
 ### 4.3 INFERRED
@@ -114,25 +117,17 @@ description: 根据户型图片或房间尺寸识别并生成具有真实墙厚�
 
 1. 预处理：`python scripts/processing.py <source.png> --output-dir <preprocessed>`
 2. 墙体生成：`python scripts/generate_by_pic.py <source.png> <walls.dxf> --data scripts/data.json --overall-width-mm <总宽> --overall-height-mm <总高> --wall-bbox <x1> <y1> <x2> <y2> --horizontal-chain-mm <横向尺寸链> --vertical-chain-top-down-mm <纵向尺寸链>`
-3. 窗户生成：`python scripts/generate_windows.py <含窗图片> <walls.dxf> <walls_windows.dxf> --data scripts/data.json --preprocessing-result <preprocessed/result.json>`
-4. 门生成：`python scripts/generate_doors.py <含门图片> <上一阶段图片> <walls_windows.dxf> <final.dxf> --data scripts/data.json --preprocessing-result <preprocessed/result.json>`
+3. 窗户生成：`python scripts/generate_windows.py <含窗图片> <walls.dxf> <walls_windows.dxf> --data scripts/data.json --overall-width-mm <总宽> --overall-height-mm <总高> --image-wall-bbox <x1> <y1> <x2> <y2> --preprocessing-result <preprocessed/result.json>`
+4. 门生成：`python scripts/generate_doors.py <含门图片> <上一阶段图片> <walls_windows.dxf> <final.dxf> --data scripts/data.json --overall-width-mm <总宽> --overall-height-mm <总高> --image-wall-bbox <x1> <y1> <x2> <y2> --preprocessing-result <preprocessed/result.json>`
 
-墙体脚本输出的 DXF 必须先校核通过，才能传给 `generate_windows.py`；窗户脚本输出必须先校核通过，才能传给 `generate_doors.py`。尺寸链和墙体外框不能凭空填写，必须来自用户、图纸标注或经过复核的图像测量。
+墙体脚本输出的 DXF 和 JSON 报告必须先校核通过，才能传给 `generate_windows.py`；窗户脚本输出的 DXF 和 JSON 报告必须先校核通过，才能传给 `generate_doors.py`。尺寸链、总宽、总高和墙体外框不能凭空填写，必须来自用户、图纸标注或经过复核的图像测量。
 
-### 文字输入流程
-
-文字尺寸任务必须调用：
-`python scripts/generate_by_txt.py --config <配置.json>`
-或使用其交互入口：
-`python scripts/generate_by_txt.py --interactive`
-
-`generate_by_txt.py` 直接连接当前活动 CAD 文档；执行前必须确认目标 CAD 已启动并存在活动图形文档。
+`generate_by_pic.py` 无论识别到实心墙带还是细线墙体，都必须先重建为闭合 `LWPOLYLINE`。禁止在 `WALLS` 或 `INNER_WALLS` 图层保留独立 `LINE` 或未闭合 `LWPOLYLINE`；无法闭合时脚本必须报错并且不得写出墙体 DXF。
 
 ### 脚本职责边界
 
 - `processing.py` 只负责图片预处理和识别证据输出。
 - `generate_by_pic.py` 只负责图片墙体及墙体尺寸 DXF。
-- `generate_by_txt.py` 负责文字配置到活动 CAD 的生成。
 - `generate_windows.py` 只负责在已校核墙体 DXF 上切窗洞并生成窗框。
 - `generate_doors.py` 只负责在已校核墙体和窗户 DXF 上切门洞并生成门图形。
 
@@ -140,10 +135,9 @@ description: 根据户型图片或房间尺寸识别并生成具有真实墙厚�
 
 ## 8. 输入方式与使用示例
 图片输入：请根据这张户型图生成墙体、窗户和门，墙体使用双线墙，并添加必要尺寸标注。必须按 processing.py → generate_by_pic.py → generate_windows.py → generate_doors.py 顺序执行。
-文字输入：生成一个两室一厅户型图；客厅 6000×4500；主卧 4500×3600；次卧 3600×3300；外墙厚度 240；内墙厚度 200。使用 generate_by_txt.py 的配置入口。
 
 ## 9. 默认参数
-单位为 mm；外墙厚度根据图片或用户要求确定；内墙厚度根据图片或用户要求确定；普通卧室门 900；卫生间门 800；入户门 1000～1200；普通窗宽 1200～1800。可靠图片或用户数据优先于默认值。
+单位为 mm。`scripts/generate_by_pic.py` 中的总宽、总高、墙体外包框和尺寸链是特定参考图的默认值，不得直接套用于新图片。每个新图片任务必须重新确认并传入 `--overall-width-mm`、`--overall-height-mm`、`--wall-bbox`、`--horizontal-chain-mm` 和 `--vertical-chain-top-down-mm`；窗户和门阶段对应传入 `--image-wall-bbox`。`scripts/data.json` 中的 `wall_width` 只作为允许墙厚候选，不能替代图片校准。
 
 ## 10. 禁止事项
 - 使用单线代替墙体
@@ -155,3 +149,5 @@ description: 根据户型图片或房间尺寸识别并生成具有真实墙厚�
 - 门洞与墙体不对应，或窗与墙体重叠
 - 将推定尺寸描述为准确尺寸
 - 为追求视觉效果破坏建筑几何关系
+- 使用脚本内置的参考图尺寸、墙体外框或尺寸链处理新图片
+- 未读取阶段 JSON 报告或未完成 PNG/CAD 检查就进入下一阶段
