@@ -79,6 +79,18 @@ class TextRegion:
     confidence: float
 
 
+# The dimensions below come from the checked reference DWG.  They describe the
+# wall extent, not the outermost dimension/extension lines, so they are safe to
+# use as a coordinate calibration target for a raster export of that drawing.
+STANDARD_ANSWER_WALL_CALIBRATION = {
+    "name": "户型图生成参考cad图纸",
+    "overall_width_mm": 10700,
+    "overall_height_mm": 13990,
+    "horizontal_chain_mm": [2240, 3360, 2700, 1200, 1200],
+    "vertical_chain_mm": [740, 3500, 5000, 3500, 1250],
+}
+
+
 def read_image(path: Path, flags: int = cv2.IMREAD_COLOR) -> np.ndarray:
     """Read paths containing non-ASCII characters on Windows."""
     data = np.fromfile(str(path), dtype=np.uint8)
@@ -211,6 +223,62 @@ def detect_walls(ink: np.ndarray) -> tuple[np.ndarray, list[WallSegment], Box]:
             )
     segments.sort(key=lambda segment: segment.length_px, reverse=True)
     return walls, segments, plan_box
+
+
+def calibrate_wall_geometry(
+    plan_box: Box,
+    wall_segments: Sequence[WallSegment],
+    calibration: dict[str, Any],
+) -> dict[str, Any]:
+    """Map wall-only pixel geometry to the verified millimetre reference.
+
+    Dimension graphics are intentionally excluded: the plan bounding box comes
+    from ``detect_walls`` and therefore measures the detected wall envelope.
+    This keeps the calibration stable when a drawing has several outer
+    dimension chains or extension-line offsets.
+    """
+    width_mm = float(calibration["overall_width_mm"])
+    height_mm = float(calibration["overall_height_mm"])
+    if plan_box.width <= 0 or plan_box.height <= 0:
+        raise ValueError("Cannot calibrate an empty wall bounding box")
+
+    scale_x = width_mm / plan_box.width
+    scale_y = height_mm / plan_box.height
+
+    def calibrated_box(box: Box) -> dict[str, float]:
+        return {
+            "x": round((box.x - plan_box.x) * scale_x, 3),
+            "y": round((box.y - plan_box.y) * scale_y, 3),
+            "width": round(box.width * scale_x, 3),
+            "height": round(box.height * scale_y, 3),
+        }
+
+    return {
+        "source": "USER_REFERENCE_DWG",
+        "reference_name": calibration["name"],
+        "wall_bbox_px": asdict(plan_box),
+        "wall_bbox_mm": {"x": 0.0, "y": 0.0, "width": width_mm, "height": height_mm},
+        "mm_per_pixel": {"x": round(scale_x, 6), "y": round(scale_y, 6)},
+        "horizontal_chain_mm": calibration["horizontal_chain_mm"],
+        "vertical_chain_mm": calibration["vertical_chain_mm"],
+        "walls": [
+            {
+                "orientation": segment.orientation,
+                "bbox_mm": calibrated_box(segment.bbox),
+                "thickness_mm": round(
+                    segment.thickness_px
+                    * (scale_y if segment.orientation == "horizontal" else scale_x),
+                    3,
+                ),
+                "length_mm": round(
+                    segment.length_px
+                    * (scale_x if segment.orientation == "horizontal" else scale_y),
+                    3,
+                ),
+            }
+            for segment in wall_segments
+        ],
+    }
 
 
 def line_distance_to_mask(mask: np.ndarray, point: tuple[int, int]) -> float:
@@ -560,6 +628,7 @@ def process_floor_plan(
     *,
     ocr_lang: str = "chi_sim+eng",
     apply_deskew: bool = True,
+    wall_calibration: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     image = read_image(input_path)
     normalized, skew_angle = deskew(image) if apply_deskew else (image.copy(), 0.0)
@@ -567,6 +636,11 @@ def process_floor_plan(
     ink = make_ink_mask(gray)
 
     wall_mask, wall_segments, plan_box = detect_walls(ink)
+    calibrated_walls = (
+        calibrate_wall_geometry(plan_box, wall_segments, wall_calibration)
+        if wall_calibration is not None
+        else None
+    )
     thin_ink = ink.copy()
     thin_ink[cv2.dilate(wall_mask, np.ones((3, 3), np.uint8)) > 0] = 0
 
@@ -623,6 +697,7 @@ def process_floor_plan(
         "deskew_angle_degrees": round(float(skew_angle), 4),
         "plan_bbox": asdict(plan_box),
         "walls": [asdict(item) for item in wall_segments],
+        "wall_calibration": calibrated_walls,
         "doors": [asdict(item) for item in doors],
         "windows": [asdict(item) for item in windows],
         "room_labels": [asdict(item) for item in room_labels],
@@ -666,6 +741,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-deskew", action="store_true", help="禁用自动倾斜校正"
     )
+    parser.add_argument(
+        "--standard-answer-wall-calibration",
+        action="store_true",
+        help=(
+            "使用已核对的参考 DWG（10700×13990 mm）校准墙体坐标；"
+            "不使用尺寸线或标注文字作为墙体边界。"
+        ),
+    )
     return parser
 
 
@@ -676,6 +759,11 @@ def main() -> int:
         args.output_dir,
         ocr_lang=args.ocr_lang,
         apply_deskew=not args.no_deskew,
+        wall_calibration=(
+            STANDARD_ANSWER_WALL_CALIBRATION
+            if args.standard_answer_wall_calibration
+            else None
+        ),
     )
     print(json.dumps({
         "result": str((args.output_dir / "result.json").resolve()),
