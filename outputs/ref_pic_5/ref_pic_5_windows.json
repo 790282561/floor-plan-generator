@@ -1,0 +1,235 @@
+{
+  "source": "D:\\中建科技\\009_自动化软件平台\\ref_pic_5.jpg",
+  "wall_dxf": "D:\\中建科技\\009_自动化软件平台\\floor-plan-generator\\outputs\\ref_pic_2\\ref_pic_2_width_regression.dxf",
+  "output": "D:\\中建科技\\009_自动化软件平台\\floor-plan-generator\\outputs\\ref_pic_5\\ref_pic_5_windows.dxf",
+  "overall_width_mm": 10700.0,
+  "overall_height_mm": 13990.0,
+  "image_wall_bbox": {
+    "x1": 382,
+    "y1": 581,
+    "x2": 1444,
+    "y2": 1954
+  },
+  "wall_width_candidates_mm": [
+    240.0,
+    180.0,
+    120.0
+  ],
+  "detector": "two-window-inner-lines-with-two-wall-faces-and-endcaps",
+  "preprocessing_evidence": {
+    "path": "D:\\中建科技\\009_自动化软件平台\\floor-plan-generator\\outputs\\ref_pic_5\\preprocessed\\result.json",
+    "walls": 0,
+    "windows": 0,
+    "warnings": [
+      "未找到 Tesseract 可执行文件；已检测文字候选区域，但 room_labels/dimensions 的 text 为 null。"
+    ]
+  },
+  "pixel_candidates": 7,
+  "accepted_windows": 7,
+  "rejected_windows": 0,
+  "converted_wall_polylines": 0,
+  "windows": [
+    {
+      "id": "W01",
+      "status": "ACCEPTED",
+      "reason": null,
+      "pixel": {
+        "orientation": "horizontal",
+        "start": 1220.0,
+        "end": 1415.0,
+        "face1": 581.0,
+        "center": 590.75,
+        "face2": 600.0,
+        "confidence": 0.848
+      },
+      "cad": {
+        "orientation": "horizontal",
+        "start": 8443.537,
+        "end": 10398.445,
+        "face1": 13790.293,
+        "face2": 13990.0,
+        "confidence": 0.848,
+        "source": "DETECTED"
+      },
+      "opening_state": "EXISTING_OPENING",
+      "cut_wall_entities": 0,
+      "wall_overlaps_before": 0,
+      "wall_overlaps_after": 0
+    },
+    {
+      "id": "W02",
+      "status": "ACCEPTED",
+      "reason": null,
+      "pixel": {
+        "orientation": "horizontal",
+        "start": 421.0,
+        "end": 566.0,
+        "face1": 653.0,
+        "center": 662.5,
+        "face2": 672.0,
+        "confidence": 0.848
+      },
+      "cad": {
+        "orientation": "horizontal",
+        "start": 395.141,
+        "end": 1850.923,
+        "face1": 13054.53,
+        "face2": 13254.237,
+        "confidence": 0.848,
+        "source": "DETECTED"
+      },
+      "opening_state": "EXISTING_OPENING",
+      "cut_wall_entities": 0,
+      "wall_overlaps_before": 0,
+      "wall_overlaps_after": 0
+    },
+    {
+      "id": "W03",
+      "status": "ACCEPTED",
+      "reason": null,
+      "pixel": {
+        "orientation": "horizontal",
+        "start": 689.0,
+        "end": 884.0,
+        "face1": 653.0,
+        "center": 662.5,
+        "face2": 672.0,
+        "confidence": 0.848
+      },
+      "cad": {
+        "orientation": "horizontal",
+        "start": 3088.338,
+        "end": 5053.644,
+        "face1": 13054.53,
+        "face2": 13254.237,
+        "confidence": 0.848,
+        "source": "DETECTED"
+      },
+      "opening_state": "EXISTING_OPENING",
+      "cut_wall_entities": 0,
+      "wall_overlaps_before": 0,
+      "wall_overlaps_after": 0
+    },
+    {
+      "id": "W04",
+      "status": "ACCEPTED",
+      "reason": null,
+      "pixel": {
+        "orientation": "horizontal",
+        "start": 967.0,
+        "end": 1162.0,
+        "face1": 653.0,
+        "center": 662.5,
+        "face2": 672.0,
+        "confidence": 0.848
+      },
+      "cad": {
+        "orientation": "horizontal",
+        "start": 5885.52,
+        "end": 7850.826,
+        "face1": 13054.53,
+        "face2": 13254.237,
+        "confidence": 0.848,
+        "source": "DETECTED"
+      },
+      "opening_state": "EXISTING_OPENING",
+      "cut_wall_entities": 0,
+      "wall_overlaps_before": 0,
+      "wall_overlaps_after": 0
+    },
+    {
+      "id": "W05",
+      "status": "ACCEPTED",
+      "reason": null,
+      "pixel": {
+        "orientation": "horizontal",
+        "start": 996.0,
+        "end": 1191.0,
+        "face1": 1630.0,
+        "center": 1639.75,
+        "face2": 1649.0,
+        "confidence": 0.848
+      },
+      "cad": {
+        "orientation": "horizontal",
+        "start": 6176.676,
+        "end": 8141.983,
+        "face1": 3111.225,
+        "face2": 3310.932,
+        "confidence": 0.848,
+        "source": "DETECTED"
+      },
+      "opening_state": "EXISTING_OPENING",
+      "cut_wall_entities": 0,
+      "wall_overlaps_before": 0,
+      "wall_overlaps_after": 0
+    },
+    {
+      "id": "W06",
+      "status": "ACCEPTED",
+      "reason": null,
+      "pixel": {
+        "orientation": "horizontal",
+        "start": 416.0,
+        "end": 561.0,
+        "face1": 1826.0,
+        "center": 1832.0,
+        "face2": 1838.0,
+        "confidence": 0.858
+      },
+      "cad": {
+        "orientation": "horizontal",
+        "start": 343.149,
+        "end": 1788.533,
+        "face1": 1187.731,
+        "face2": 1313.862,
+        "confidence": 0.858,
+        "source": "DETECTED"
+      },
+      "opening_state": "EXISTING_OPENING",
+      "cut_wall_entities": 0,
+      "wall_overlaps_before": 0,
+      "wall_overlaps_after": 0
+    },
+    {
+      "id": "W07",
+      "status": "ACCEPTED",
+      "reason": null,
+      "pixel": {
+        "orientation": "horizontal",
+        "start": 768.0,
+        "end": 913.0,
+        "face1": 1826.0,
+        "center": 1832.0,
+        "face2": 1838.0,
+        "confidence": 0.858
+      },
+      "cad": {
+        "orientation": "horizontal",
+        "start": 3733.042,
+        "end": 5344.801,
+        "face1": 1187.731,
+        "face2": 1313.862,
+        "confidence": 0.858,
+        "source": "DETECTED"
+      },
+      "opening_state": "EXISTING_OPENING",
+      "cut_wall_entities": 0,
+      "wall_overlaps_before": 0,
+      "wall_overlaps_after": 0
+    }
+  ],
+  "topology": {
+    "wall_overlaps_after": 0,
+    "wall_topology": "closed-lwpolylines",
+    "added_wall_caps": 9,
+    "closed_wall_polylines": 7,
+    "remaining_wall_lines": 0,
+    "open_wall_endpoints": 0,
+    "closed_window_frames": 7
+  },
+  "audit_errors": 0,
+  "audit_fixes": 0,
+  "target_cad_visual_check": true,
+  "target_cad_visual_check_details": "已在中望 CAD 2025 中重新打开修正版 DXF，核对闭合墙体重建后墙线、窗洞及窗框的实际显示。"
+}
