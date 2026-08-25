@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -455,6 +456,12 @@ def entity_axis_line(entity) -> tuple[str, float, float, float] | None:
 def explode_wall_polylines(msp) -> int:
     """把正交墙体多段线转成可切洞的线段，尺寸及其他图层保持不变。"""
 
+    # Disabled in image-baseline mode. Converting every wall polyline changes
+    # the complete wall representation and can silently replace the measured
+    # image baseline with a reconstructed line model. Openings must be handled
+    # locally; unmatched candidates are drawn as image-only window geometry.
+    return 0
+
     converted = 0
     for entity in list(msp):
         if entity.dxftype() != "LWPOLYLINE" or entity.dxf.layer not in WALL_LAYERS:
@@ -468,6 +475,14 @@ def explode_wall_polylines(msp) -> int:
         msp.delete_entity(entity)
         converted += 1
     return converted
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def unique_wall_coordinates(msp, orientation: str) -> tuple[list[float], list[float]]:
@@ -1068,6 +1083,8 @@ def generate(
     report = {
         "source": str(source.resolve()),
         "wall_dxf": str(wall_dxf.resolve()),
+        "wall_baseline_sha256": file_sha256(wall_dxf),
+        "wall_baseline_policy": "fixed-source-image-geometry",
         "output": str(output.resolve()),
         "overall_width_mm": overall_width_mm,
         "overall_height_mm": overall_height_mm,

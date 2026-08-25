@@ -45,6 +45,45 @@ def read_gray(path: Path) -> np.ndarray:
     return image
 
 
+def apply_high_weight_wall_mask(
+    gray: np.ndarray,
+    wall_mask_path: Path | None,
+    mask_weight: float,
+) -> tuple[np.ndarray, dict]:
+    if wall_mask_path is None:
+        return gray, {
+            "wall_mask_used": False,
+            "wall_mask_weight": 0.0,
+            "wall_mask_path": None,
+        }
+    if not 0.5 < mask_weight <= 1.0:
+        raise ValueError("wall mask weight 必须大于 0.5 且不超过 1.0")
+    mask_gray = read_gray(wall_mask_path)
+    if mask_gray.shape != gray.shape:
+        mask_gray = cv2.resize(
+            mask_gray, (gray.shape[1], gray.shape[0]), interpolation=cv2.INTER_NEAREST
+        )
+    source_ink = gray < 190
+    mask_ink = mask_gray >= 127
+    weighted_score = mask_ink.astype(np.float32) * mask_weight + source_ink.astype(np.float32) * (1.0 - mask_weight)
+    fused_ink = weighted_score >= 0.5
+    intersection = int(np.count_nonzero(source_ink & mask_ink))
+    union = int(np.count_nonzero(source_ink | mask_ink))
+    mask_pixels = int(np.count_nonzero(mask_ink))
+    fused = np.where(fused_ink, 0, 255).astype(np.uint8)
+    return fused, {
+        "wall_mask_used": True,
+        "wall_mask_weight": round(mask_weight, 3),
+        "wall_mask_path": str(wall_mask_path.resolve()),
+        "wall_mask_pixels": mask_pixels,
+        "source_mask_iou": round(intersection / max(union, 1), 4),
+        "mask_wall_retention": round(
+            np.count_nonzero(fused_ink & mask_ink) / max(mask_pixels, 1), 4
+        ),
+        "evidence_policy": "wall-mask-high-weight",
+    }
+
+
 def keep_wall_components(mask: np.ndarray) -> np.ndarray:
     """Drop isolated reference markers while preserving every wall piece."""
     count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
@@ -677,9 +716,17 @@ def write_preview(
     image.save(path)
 
 
-def generate(source: Path, output: Path) -> dict:
+def generate(
+    source: Path,
+    output: Path,
+    wall_mask: Path | None = None,
+    wall_mask_weight: float = 0.85,
+) -> dict:
     gray = read_gray(source)
-    lines, polylines, stats = extract_wall_geometry(gray)
+    wall_evidence, mask_stats = apply_high_weight_wall_mask(
+        gray, wall_mask, wall_mask_weight
+    )
+    lines, polylines, stats = extract_wall_geometry(wall_evidence)
     stage_issues: list[str] = []
     # Independent lines are valid source evidence in image-faithful mode.
     # No repair item is created for open walls: closure is deliberately not
@@ -747,6 +794,7 @@ def generate(source: Path, output: Path) -> dict:
         "audit_fixes": len(auditor.fixes),
         "stage_status": "needs_repair" if stage_issues else "ready",
         "repair_queue": stage_issues,
+        **mask_stats,
         **stats,
     }
     output.with_suffix(".json").write_text(
@@ -770,6 +818,17 @@ def main() -> int:
     )
     parser.add_argument("--overall-width-mm", type=float, default=OVERALL_WIDTH_MM)
     parser.add_argument("--overall-height-mm", type=float, default=OVERALL_HEIGHT_MM)
+    parser.add_argument(
+        "--wall-mask",
+        type=Path,
+        help="processing.py 生成的 masks/walls.png；作为墙体轮廓高权重证据",
+    )
+    parser.add_argument(
+        "--wall-mask-weight",
+        type=float,
+        default=0.85,
+        help="墙体 mask 权重，必须大于 0.5；默认 0.85",
+    )
     parser.add_argument(
         "--wall-bbox",
         nargs=4,
@@ -805,7 +864,12 @@ def main() -> int:
         parser.error("横向尺寸链之和必须等于 overall-width-mm")
     if abs(sum(VERTICAL_CHAIN_TOP_DOWN_MM) - OVERALL_HEIGHT_MM) > 0.01:
         parser.error("纵向尺寸链之和必须等于 overall-height-mm")
-    print(json.dumps(generate(args.source, args.output), ensure_ascii=False, indent=2))
+    print(json.dumps(generate(
+        args.source,
+        args.output,
+        wall_mask=args.wall_mask,
+        wall_mask_weight=args.wall_mask_weight,
+    ), ensure_ascii=False, indent=2))
     return 0
 
 

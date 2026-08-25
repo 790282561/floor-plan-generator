@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 from dataclasses import asdict, dataclass
@@ -526,6 +527,48 @@ def raw_cad_door(
     )
 
 
+def constrain_door_to_pixel_bbox(
+    door: CadDoor,
+    pixel: PixelDoor,
+    bbox: tuple[int, int, int, int],
+    overall_width_mm: float,
+    overall_height_mm: float,
+) -> tuple[CadDoor, dict]:
+    """Hard-limit opening/leaf/arc size to the detected image bounding box."""
+    if door.orientation == "horizontal":
+        bbox_start = pixel_to_cad_x(pixel.x, bbox, overall_width_mm)
+        bbox_end = pixel_to_cad_x(pixel.x + pixel.width, bbox, overall_width_mm)
+    else:
+        values = [
+            pixel_to_cad_y(pixel.y, bbox, overall_height_mm),
+            pixel_to_cad_y(pixel.y + pixel.height, bbox, overall_height_mm),
+        ]
+        bbox_start, bbox_end = min(values), max(values)
+    bbox_start, bbox_end = sorted((bbox_start, bbox_end))
+    constrained_start = max(door.start, bbox_start)
+    constrained_end = min(door.end, bbox_end)
+    if constrained_end <= constrained_start:
+        constrained_start, constrained_end = bbox_start, bbox_end
+    constrained = CadDoor(
+        kind=door.kind,
+        orientation=door.orientation,
+        start=round(constrained_start, 3),
+        end=round(constrained_end, 3),
+        face1=door.face1,
+        face2=door.face2,
+        confidence=door.confidence,
+        leaves=door.leaves,
+    )
+    return constrained, {
+        "bbox_start_cad": round(bbox_start, 3),
+        "bbox_end_cad": round(bbox_end, 3),
+        "bbox_max_width_mm": round(bbox_end - bbox_start, 3),
+        "original_width_mm": round(door.opening_width, 3),
+        "generated_width_mm": round(constrained.opening_width, 3),
+        "clamped": abs(constrained.start - door.start) > 0.001 or abs(constrained.end - door.end) > 0.001,
+    }
+
+
 def entity_axis_line(entity) -> tuple[str, float, float, float] | None:
     if entity.dxftype() != "LINE" or entity.dxf.layer not in WALL_LAYERS:
         return None
@@ -539,6 +582,10 @@ def entity_axis_line(entity) -> tuple[str, float, float, float] | None:
 
 
 def explode_wall_polylines(msp) -> int:
+    # Disabled in image-baseline mode. Never convert or replace the complete
+    # wall model during the door stage; only opening-local LINE edits are
+    # permitted, otherwise draw the door as ACCEPTED_IMAGE_ONLY.
+    return 0
     converted = 0
     for entity in list(msp):
         if entity.dxftype() != "LWPOLYLINE" or entity.dxf.layer not in WALL_LAYERS:
@@ -552,6 +599,14 @@ def explode_wall_polylines(msp) -> int:
         msp.delete_entity(entity)
         converted += 1
     return converted
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def unique_wall_coordinates(msp, orientation: str) -> list[float]:
@@ -1298,7 +1353,14 @@ def generate(
                 overall_width_mm,
                 overall_height_mm,
             )
+            raw, bbox_constraint = constrain_door_to_pixel_bbox(
+                raw, pixel, plan_bbox, overall_width_mm, overall_height_mm
+            )
             normalized, reason = normalize_door_to_wall(raw, msp, wall_widths)
+            if normalized is not None:
+                normalized, bbox_constraint = constrain_door_to_pixel_bbox(
+                    normalized, pixel, plan_bbox, overall_width_mm, overall_height_mm
+                )
         except RuntimeError as error:
             reason = str(error)
             orientation = pixel.orientation_hint or (
@@ -1326,6 +1388,9 @@ def generate(
                 confidence=pixel.confidence,
                 leaves=pixel.leaves,
             )
+            raw, bbox_constraint = constrain_door_to_pixel_bbox(
+                raw, pixel, plan_bbox, overall_width_mm, overall_height_mm
+            )
             normalized = None
         if normalized is None:
             if raw is not None:
@@ -1345,6 +1410,7 @@ def generate(
                     "reason": reason,
                     "pixel": asdict(pixel),
                     "mapped_cad": asdict(raw),
+                    "bbox_constraint": bbox_constraint,
                     "removed_misclassified_windows": removed_misclassified_windows,
                     "geometry": geometry,
                 })
@@ -1355,6 +1421,7 @@ def generate(
                 "reason": reason,
                 "pixel": asdict(pixel),
                 "mapped_cad": asdict(raw) if raw is not None else None,
+                "bbox_constraint": bbox_constraint if raw is not None else None,
             })
             continue
         removed_misclassified_windows = remove_windows_overlapping_door(msp, normalized)
@@ -1370,6 +1437,7 @@ def generate(
                 "reason": "与已接受门洞重叠",
                 "pixel": asdict(pixel),
                 "mapped_cad": asdict(normalized),
+                "bbox_constraint": bbox_constraint,
             })
             continue
 
@@ -1382,6 +1450,7 @@ def generate(
                 "reason": "门洞范围内仍有墙体边界重叠",
                 "pixel": asdict(pixel),
                 "mapped_cad": asdict(normalized),
+                "bbox_constraint": bbox_constraint,
                 "wall_overlaps_before": before,
                 "wall_overlaps_after": after,
             })
@@ -1398,6 +1467,7 @@ def generate(
             "reason": None,
             "pixel": asdict(pixel),
             "cad": asdict(normalized),
+            "bbox_constraint": bbox_constraint,
             "opening_state": "CUT_FROM_CONTINUOUS_WALL" if changed else "EXISTING_OPENING",
             "cut_wall_entities": changed,
             "wall_overlaps_before": before,
@@ -1432,6 +1502,8 @@ def generate(
         "source": str(source.resolve()),
         "previous_stage_image": str(previous_image.resolve()),
         "wall_window_dxf": str(wall_window_dxf.resolve()),
+        "wall_baseline_sha256": file_sha256(wall_window_dxf),
+        "wall_baseline_policy": "fixed-source-image-geometry",
         "output": str(output.resolve()),
         "overall_width_mm": overall_width_mm,
         "overall_height_mm": overall_height_mm,

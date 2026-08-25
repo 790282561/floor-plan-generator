@@ -36,15 +36,15 @@ description: 根据户型图片分阶段识别并生成具有真实墙厚的墙�
 ### 2.2 建筑外轮廓识别
 识别整体边界、凹凸关系、转角、阳台、露台、门廊和附属空间，建立建筑外轮廓。
 ### 2.3 墙体识别
-识别墙体两侧边界、中心位置、长度、方向、厚度、端点和连接关系，并用 overlay.png 与 walls.png 复核。不得将墙体简化为单根中心线。
+识别墙体两侧边界、中心位置、长度、方向、厚度、端点和连接关系。`masks/walls.png` 是墙体轮廓的高权重主证据，默认权重为 0.85，原图灰度线权重为 0.15；不得只在生成后用 mask 复核。轮廓与 mask 一致时优先保留，原图细线与 mask 冲突时显著降权，避免把门扇、门槛、尺寸线或家具线吸入墙体。报告必须记录 mask 路径、权重、像素数、原图-mask IoU 和 mask 墙体保留率。不得将墙体简化为单根中心线。
 ### 2.4 墙体拓扑重建
-重建水平墙、垂直墙、L 型、T 型、十字型和转角连接，保证连续、无断裂、重复或悬空。
+当前图片生成的墙体 DXF 是本任务唯一墙体基线。重建水平墙、垂直墙、L 型、T 型、十字型和转角连接时，只能在当前图片证据范围内局部处理；禁止切换到历史人工重建墙、其他参考图墙体或预置洞口模型。每个后续阶段必须记录输入墙体路径和 SHA-256。
 ### 2.5 墙体断口识别
 识别门洞、窗洞及其他开口，确定所属墙段、方向、位置、宽度和开口边界。开口必须进入墙体几何模型。
 ### 2.6 门洞识别
 识别单开门、双开门、推拉门、入户门、阳台门、卫生间门及其他门洞。门洞必须位于墙体上并形成真实开口。
 ### 2.7 门扇识别
-识别门扇宽度、铰链位置、门扇方向和门型。平开门使用门扇线和开启弧表达，推拉门使用两扇相互搭接的门板线框表达。
+识别门扇宽度、铰链位置、门扇方向和门型。门候选的 `boundingbox` 是尺寸硬边界：映射到 CAD 后，门洞宽度、门扇长度、开启弧半径及推拉门板总范围均不得超过 boundingbox 在所属墙向上的映射尺寸。墙线吸附、门槛匹配和拓扑修正只能缩小或保持尺寸，禁止扩大。平开门使用门扇线和开启弧表达，推拉门使用两扇相互搭接的门板线框表达。
 ### 2.8 门开启方向识别
 结合 wall_orientation、swing_direction 和 overlay.png 判断开启方向。无法可靠判断时标记 INFERRED，不得伪造为确定方向。
 ### 2.9 窗识别
@@ -64,7 +64,7 @@ description: 根据户型图片分阶段识别并生成具有真实墙厚的墙�
 ### 2.15 绘后检查
 每个生成脚本都必须读取其输出的同名 JSON 报告并完成阶段验收：墙体阶段记录墙线、多段线和审计信息；窗户阶段记录 `accepted_windows`、`accepted_image_only_windows` 和 `audit_errors`；门阶段记录 `accepted_doors`、`accepted_image_only_doors` 和 `audit_errors`。无论候选为空、候选匹配失败、候选重叠、墙体不封闭、存在开放折线或审计问题，均不得中途停止计算：必须保留当前 DXF/PNG/JSON，写入 `repair_queue`，标记 `stage_status: needs_repair`，并继续后续阶段。只要任一识别证据中存在门窗候选，就必须按图片坐标生成对应图元；墙体匹配成功时切真实洞口，匹配失败时生成 `ACCEPTED_IMAGE_ONLY` 图元。`needs_repair` 仅是报告状态，绝不是跳过生成或终止流程的条件。只有输入不可读、输出无法写入或数据损坏等致命错误才允许结束进程。
 ### 2.16 局部纠错
-只修改对应局部对象，并重新检查相邻墙体、门窗、房间和尺寸关系。不得因局部纠错改变无关区域。
+只修改对应门窗 bounding box 及必要墙厚缓冲范围内的局部对象，并重新检查相邻墙体、门窗、房间和尺寸关系。不得全量炸开、转换、删除或重建全部墙体多段线，不得因局部纠错改变无关区域。被误识别为墙的门槛、门扇线只能在对应门候选范围内剔除。
 
 ### 2.17 预处理证据的使用边界
 `processing.py` 生成的 `result.json`、`overlay.png` 和 masks 是识别证据与降级输入。窗户位置和几何优先由 `generate_windows.py` 根据图片重新计算；主检测器无候选时，必须回退使用 `result.json` 的窗候选生成 `ACCEPTED_IMAGE_ONLY` 图元。门的位置、门型和开启方向优先由 `generate_doors.py` 根据阶段图片重新计算；差分检测无候选时，必须回退使用 `result.json` 的门候选生成 `ACCEPTED_IMAGE_ONLY` 图元。房间名称优先使用用户名称，其次使用明确 OCR；OCR 不可用或为空时，必须根据图像布局和室内构件进行视觉推断，写入 `inferred_room_labels.json` 并继续落图。候选框可作为降级几何范围，但必须在报告中标记来源和不确定性。
@@ -105,6 +105,8 @@ description: 根据户型图片分阶段识别并生成具有真实墙厚的墙�
 先在所属墙体中创建真实门洞，再放置门扇和开启弧；禁止在完整墙体上直接叠加门符号。
 ### 5.4 门扇规则
 平开门表达门扇、铰链和开启弧；双开门表达两扇门；推拉门表达两扇相互搭接的门板。
+### 5.4a 门 boundingbox 尺寸约束
+每个门必须记录像素 boundingbox、映射后的 `bbox_max_width_mm`、生成前宽度、最终生成宽度和是否发生截断。最终门洞起终点必须位于 boundingbox 映射区间内，`generated_width_mm <= bbox_max_width_mm`；平开门的门扇长度和圆弧半径必须等于最终门洞宽度，推拉门板不得越出最终门洞。不得为了匹配附近墙端点、门槛封边或常用门宽而扩大图片检测尺寸。
 ### 5.5 门开启方向规则
 开启方向由铰链、门扇和开启弧共同表达，并应与图片和房间交通关系一致。
 ### 5.6 窗洞规则
@@ -137,11 +139,11 @@ description: 根据户型图片分阶段识别并生成具有真实墙厚的墙�
 
 1. 预处理：`python scripts/processing.py <source.png> --output-dir <preprocessed>`
 2. 多模态/OpenCV 融合：`python scripts/multimodal_fusion.py <source.png> --preprocessed-dir <preprocessed> --output <preprocessed/multimodal.json>`；读取 `multimodal.json`，按 `wall`、`window`、`door` 分流并处理冲突。
-3. 墙体生成：`python scripts/generate_by_pic.py <source.png> <walls.dxf> --data scripts/data.json --overall-width-mm <总宽> --overall-height-mm <总高> --wall-bbox <x1> <y1> <x2> <y2> --horizontal-chain-mm <横向尺寸链> --vertical-chain-top-down-mm <纵向尺寸链>`
+3. 墙体生成：`python scripts/generate_by_pic.py <source.png> <walls.dxf> --data scripts/data.json --wall-mask <preprocessed/masks/walls.png> --wall-mask-weight 0.85 --overall-width-mm <总宽> --overall-height-mm <总高> --wall-bbox <x1> <y1> <x2> <y2> --horizontal-chain-mm <横向尺寸链> --vertical-chain-top-down-mm <纵向尺寸链>`
 4. 窗户生成：`python scripts/generate_windows.py <含窗图片> <walls.dxf> <walls_windows.dxf> --data scripts/data.json --overall-width-mm <总宽> --overall-height-mm <总高> --image-wall-bbox <x1> <y1> <x2> <y2> --preprocessing-result <preprocessed/result.json>`
 5. 门及房间名称生成：`python scripts/generate_doors.py <含门图片> <上一阶段图片> <walls_windows.dxf> <final.dxf> --data scripts/data.json --overall-width-mm <总宽> --overall-height-mm <总高> --image-wall-bbox <x1> <y1> <x2> <y2> --preprocessing-result <preprocessed/result.json> --inferred-room-labels <inferred_room_labels.json>`
 
-墙体脚本输出的 DXF 和 JSON 报告必须先读取并记录，再传给 `generate_windows.py`；若墙体尚未闭合，窗户和门脚本以“候选识别/待修复模式”运行，输出候选报告并继续门阶段，不得把结果标记为最终 CAD 合格。原图窗线和门线不是中断条件。尺寸链、总宽、总高和墙体外框不能凭空填写，必须来自用户、图纸标注或经过复核的图像测量。
+墙体脚本输出的 DXF 和 JSON 报告必须先读取并记录，再原样传给 `generate_windows.py`；后续报告必须记录该基线的绝对路径和 SHA-256。若墙体尚未闭合，窗户和门脚本仍继续生成图元，但不得替换为历史闭合墙模型，也不得全量将墙体 `LWPOLYLINE` 转换为 `LINE`。原图窗线和门线不是中断条件。尺寸链、总宽、总高和墙体外框不能凭空填写，必须来自用户、图纸标注或经过复核的图像测量。
 
 `generate_by_pic.py` 无论识别到实心墙带还是细线墙体，都应尝试重建为闭合 `LWPOLYLINE`。禁止将独立 `LINE` 或未闭合 `LWPOLYLINE` 当作最终墙体；无法闭合时脚本应写出带 `stage_status: needs_repair`、问题位置和 `repair_queue` 的中间 DXF/JSON/PNG，并返回可被上层流程记录的非致命阶段状态，不得因单个墙段问题直接结束整条识别流程。
 
@@ -175,14 +177,18 @@ description: 根据户型图片分阶段识别并生成具有真实墙厚的墙�
 - 使用单线代替墙体
 - 忽略或随意改变墙体厚度、房间数量和建筑外轮廓
 - 未执行图片预处理就直接生成
+- 墙体生成时不传入 `masks/walls.png`，或将 mask 权重设置为不高于原图权重
 - 因低置信度、`needs_repair` 或墙体匹配失败而跳过已有图片候选的门窗图元
 - 将门窗放置在墙体之外
 - 只叠加门窗符号而不创建真实墙体洞口
 - 门洞与墙体不对应，或窗与墙体重叠
 - 在同一门弧区域同时保留门和窗图元
+- 将门洞、门扇、门弧或推拉门板扩大到门候选 boundingbox 之外
 - 把单段普通窗或门弧误判为转角窗
 - 在没有完整四条平行线或四条连续 L 形线证据时生成窗、转角窗图元
 - 将推定尺寸描述为准确尺寸
 - 为追求视觉效果破坏建筑几何关系
+- 在门窗阶段复用历史墙体 DXF、其他图片墙体模型或预置洞口墙体
+- 全量炸开、转换或重建当前图片墙体，导致墙体基线整体变化
 - 使用脚本内置的参考图尺寸、墙体外框或尺寸链处理新图片
 - 未读取阶段 JSON 报告或未完成 PNG/CAD 检查就进入下一阶段
