@@ -18,6 +18,7 @@ from typing import Iterable, Sequence
 import cv2
 import ezdxf
 import numpy as np
+from ezdxf.enums import TextEntityAlignment
 from PIL import Image, ImageDraw
 
 
@@ -27,6 +28,7 @@ DEFAULT_WALL_WIDTHS_MM = [240.0, 180.0, 120.0]
 WALL_LAYERS = {"WALLS", "INNER_WALLS"}
 WINDOW_LAYER = "WINDOWS"
 DOOR_LAYER = "DOORS"
+ROOM_LAYER = "ROOM_NAMES"
 
 
 @dataclass(frozen=True)
@@ -48,6 +50,7 @@ class PixelDoor:
     height: int
     leaves: tuple[PixelLeaf, ...]
     confidence: float
+    orientation_hint: str | None = None
 
 
 @dataclass(frozen=True)
@@ -702,6 +705,22 @@ def remove_closed_collinear_vertices(
 
 
 def rebuild_closed_wall_polylines(msp, maximum_closure_mm: float) -> dict:
+    # Compatibility entry point only. Image-faithful mode never modifies or
+    # rejects walls based on closure, even if older callers still invoke it.
+    return {
+        "wall_topology": "source-image-preserved",
+        "added_wall_caps": 0,
+        "closed_wall_polylines": sum(
+            1 for entity in msp
+            if entity.dxftype() == "LWPOLYLINE"
+            and entity.dxf.layer in WALL_LAYERS
+            and entity.closed
+        ),
+        "remaining_wall_lines": sum(
+            1 for entity in msp
+            if entity.dxftype() == "LINE" and entity.dxf.layer in WALL_LAYERS
+        ),
+    }
     line_entities = [
         entity for entity in msp
         if entity.dxftype() == "LINE" and entity.dxf.layer in WALL_LAYERS
@@ -1083,6 +1102,113 @@ def load_preprocessing_evidence(path: Path | None) -> dict | None:
     }
 
 
+def load_preprocessing_doors(path: Path | None) -> list[PixelDoor]:
+    if path is None or not path.exists():
+        return []
+    data = json.loads(path.read_text(encoding="utf-8"))
+    result: list[PixelDoor] = []
+    angle_by_direction = {
+        "up-left": 180,
+        "up-right": 0,
+        "down-left": 180,
+        "down-right": 0,
+    }
+    for item in data.get("doors", []):
+        box = item.get("bbox") or {}
+        x = int(box.get("x", 0))
+        y = int(box.get("y", 0))
+        width = int(box.get("width", 0))
+        height = int(box.get("height", 0))
+        hinge = item.get("hinge") or [x + width / 2.0, y + height / 2.0]
+        radius = float(item.get("radius_px", min(width, height) / 2.0))
+        orientation = item.get("wall_orientation")
+        if width <= 0 or height <= 0 or radius <= 0 or orientation not in {"horizontal", "vertical"}:
+            continue
+        direction = item.get("swing_direction", "up-right")
+        if orientation == "horizontal":
+            leaf_angle = 270 if direction.startswith("up") else 90
+        else:
+            leaf_angle = angle_by_direction.get(direction, 0)
+        quadrant = 0 if leaf_angle in {0, 90} else 180
+        leaf = PixelLeaf(
+            center_x=float(hinge[0]),
+            center_y=float(hinge[1]),
+            radius=radius,
+            quadrant_start_image_deg=quadrant,
+            leaf_image_angle_deg=leaf_angle,
+            confidence=float(item.get("confidence", 0.5)),
+        )
+        result.append(PixelDoor(
+            kind="swing_single",
+            x=x,
+            y=y,
+            width=width,
+            height=height,
+            leaves=(leaf,),
+            confidence=float(item.get("confidence", 0.5)),
+            orientation_hint=orientation,
+        ))
+    return result
+
+
+def add_inferred_room_labels(
+    doc,
+    msp,
+    path: Path | None,
+    bbox: tuple[int, int, int, int],
+    overall_width_mm: float,
+    overall_height_mm: float,
+) -> list[dict]:
+    if path is None:
+        return []
+    data = json.loads(path.read_text(encoding="utf-8"))
+    items = data.get("rooms", []) if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        raise ValueError("房间名称 JSON 必须是数组或包含 rooms 数组")
+    if ROOM_LAYER not in doc.layers:
+        doc.layers.add(ROOM_LAYER, color=3, linetype="CONTINUOUS")
+    style_name = "FP-TEXT"
+    if style_name not in doc.styles:
+        doc.styles.add(style_name, font="msyh.ttf")
+    text_height = max(220.0, min(420.0, min(overall_width_mm, overall_height_mm) / 32.0))
+    records: list[dict] = []
+    for index, item in enumerate(items, start=1):
+        if not isinstance(item, dict) or not str(item.get("name", "")).strip():
+            continue
+        name = str(item["name"]).strip()
+        position = item.get("position_px")
+        if not position:
+            room_bbox = item.get("bbox_px") or item.get("bbox")
+            if isinstance(room_bbox, dict):
+                position = [
+                    float(room_bbox.get("x", 0)) + float(room_bbox.get("width", 0)) / 2.0,
+                    float(room_bbox.get("y", 0)) + float(room_bbox.get("height", 0)) / 2.0,
+                ]
+            elif isinstance(room_bbox, (list, tuple)) and len(room_bbox) == 4:
+                position = [float(room_bbox[0]) + float(room_bbox[2]) / 2.0, float(room_bbox[1]) + float(room_bbox[3]) / 2.0]
+        if not isinstance(position, (list, tuple)) or len(position) != 2:
+            continue
+        cad_position = (
+            pixel_to_cad_x(float(position[0]), bbox, overall_width_mm),
+            pixel_to_cad_y(float(position[1]), bbox, overall_height_mm),
+        )
+        msp.add_text(
+            name,
+            height=text_height,
+            dxfattribs={"layer": ROOM_LAYER, "style": style_name},
+        ).set_placement(cad_position, align=TextEntityAlignment.MIDDLE_CENTER)
+        records.append({
+            "id": f"R{index:02d}",
+            "name": name,
+            "position_px": [float(position[0]), float(position[1])],
+            "position_cad": [round(cad_position[0], 3), round(cad_position[1], 3)],
+            "text_height": round(text_height, 3),
+            "source": "INFERRED_VISUAL",
+            "confidence": float(item.get("confidence", 0.6)),
+        })
+    return records
+
+
 def generate(
     source: Path,
     previous_image: Path,
@@ -1093,13 +1219,27 @@ def generate(
     overall_height_mm: float,
     image_wall_bbox: tuple[int, int, int, int] | None = None,
     preprocessing_result: Path | None = None,
+    inferred_room_labels: Path | None = None,
 ) -> dict:
     source_gray = read_gray(source)
     previous_gray = read_gray(previous_image)
     wall_widths = load_wall_widths(data_path)
     plan_bbox = image_wall_bbox or detect_plan_bbox(previous_gray)
-    pixel_doors, door_mask, rejected_components = detect_doors(source_gray, previous_gray, plan_bbox)
+    detection_warning = None
+    try:
+        pixel_doors, door_mask, rejected_components = detect_doors(source_gray, previous_gray, plan_bbox)
+    except ValueError as error:
+        pixel_doors = []
+        door_mask = np.zeros_like(source_gray)
+        rejected_components = []
+        detection_warning = str(error)
+    preprocessing_fallback = False
+    if not pixel_doors:
+        pixel_doors = load_preprocessing_doors(preprocessing_result)
+        preprocessing_fallback = bool(pixel_doors)
     stage_issues: list[str] = []
+    if detection_warning:
+        stage_issues.append(f"门差分检测降级：{detection_warning}")
     if not pixel_doors:
         stage_issues.append("差分图中未找到满足规则的平开门或推拉门；保留上一阶段图形并继续流程")
 
@@ -1113,7 +1253,7 @@ def generate(
     records: list[dict] = []
     for index, pixel in enumerate(pixel_doors, start=1):
         try:
-            preferred_orientation = None
+            preferred_orientation = pixel.orientation_hint
             if pixel.kind == "sliding":
                 preferred_orientation = "horizontal" if pixel.width >= pixel.height else "vertical"
             elif pixel.kind == "swing_double":
@@ -1139,8 +1279,33 @@ def generate(
             )
             normalized, reason = normalize_door_to_wall(raw, msp, wall_widths)
         except RuntimeError as error:
-            normalized, reason = None, str(error)
-            raw = None
+            reason = str(error)
+            orientation = pixel.orientation_hint or (
+                "horizontal" if pixel.width >= pixel.height else "vertical"
+            )
+            wall_width = min(wall_widths)
+            if orientation == "horizontal":
+                start = pixel_to_cad_x(pixel.x, plan_bbox, overall_width_mm)
+                end = pixel_to_cad_x(pixel.x + pixel.width, plan_bbox, overall_width_mm)
+                center = pixel_to_cad_y(pixel.y + pixel.height / 2.0, plan_bbox, overall_height_mm)
+            else:
+                values = [
+                    pixel_to_cad_y(pixel.y, plan_bbox, overall_height_mm),
+                    pixel_to_cad_y(pixel.y + pixel.height, plan_bbox, overall_height_mm),
+                ]
+                start, end = min(values), max(values)
+                center = pixel_to_cad_x(pixel.x + pixel.width / 2.0, plan_bbox, overall_width_mm)
+            raw = CadDoor(
+                kind=pixel.kind,
+                orientation=orientation,
+                start=min(start, end),
+                end=max(start, end),
+                face1=center - wall_width / 2.0,
+                face2=center + wall_width / 2.0,
+                confidence=pixel.confidence,
+                leaves=pixel.leaves,
+            )
+            normalized = None
         if normalized is None:
             if raw is not None:
                 # Preserve a detected door even when wall matching fails.
@@ -1227,17 +1392,23 @@ def generate(
 
     if not accepted:
         stage_issues.append("门候选全部被墙体匹配规则拒绝；保留上一阶段图形并继续流程")
-    try:
-        wall_topology = rebuild_closed_wall_polylines(msp, max(wall_widths) + 1.0)
-    except RuntimeError as error:
-        stage_issues.append(f"墙体拓扑校核未通过：{error}")
-        wall_topology = {"wall_topology": "needs_repair", "topology_error": str(error)}
+    # Preserve the source wall geometry. Wall closure is neither rebuilt nor
+    # used as a gate for door entity generation.
+    wall_topology = {"wall_topology": "source-image-preserved"}
     final_overlaps = sum(count_wall_overlaps(msp, door) for door in accepted)
     if final_overlaps:
         stage_issues.append(f"闭合墙体重建后门洞内仍有 {final_overlaps} 条墙体边界")
     door_geometry_collisions = validate_door_geometry(msp)
     if door_geometry_collisions:
         stage_issues.append(f"门线与墙体或窗线相交（共 {len(door_geometry_collisions)} 处）")
+    room_labels = add_inferred_room_labels(
+        doc,
+        msp,
+        inferred_room_labels,
+        plan_bbox,
+        overall_width_mm,
+        overall_height_mm,
+    )
     output.parent.mkdir(parents=True, exist_ok=True)
     doc.saveas(output)
     auditor = doc.audit()
@@ -1253,7 +1424,13 @@ def generate(
         "detector": "stage-difference-quarter-arc-and-multiline-sliding-door",
         "preprocessing_evidence": load_preprocessing_evidence(preprocessing_result),
         "pixel_candidates": len(pixel_doors),
+        "preprocessing_candidate_fallback": preprocessing_fallback,
         "accepted_doors": len(accepted),
+        "accepted_image_only_doors": sum(
+            1 for item in records if item.get("status") == "ACCEPTED_IMAGE_ONLY"
+        ),
+        "room_labels": room_labels,
+        "room_label_count": len(room_labels),
         "rejected_doors": len(records) - len(accepted),
         "rejected_difference_components": rejected_components,
         "converted_wall_polylines": converted,
@@ -1291,6 +1468,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--overall-height-mm", type=float, default=DEFAULT_HEIGHT_MM)
     parser.add_argument("--image-wall-bbox", nargs=4, type=int, metavar=("X1", "Y1", "X2", "Y2"), help="图片中的墙体外包框；省略时自动识别")
     parser.add_argument("--preprocessing-result", type=Path, help="processing.py 生成的 result.json")
+    parser.add_argument(
+        "--inferred-room-labels",
+        type=Path,
+        help="视觉读取生成的房间名称 JSON；OCR 不可用时写入 ROOM_NAMES 图层",
+    )
     return parser
 
 
@@ -1306,6 +1488,7 @@ def main() -> int:
         overall_height_mm=args.overall_height_mm,
         image_wall_bbox=tuple(args.image_wall_bbox) if args.image_wall_bbox else None,
         preprocessing_result=args.preprocessing_result,
+        inferred_room_labels=args.inferred_room_labels,
     )
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0

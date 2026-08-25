@@ -575,6 +575,23 @@ def rebuild_closed_wall_polylines(
 ) -> dict:
     """补齐墙厚方向的小封边，并把所有墙体线追踪为闭合多段线。"""
 
+    # Compatibility entry point only. Image-faithful mode never modifies or
+    # rejects walls based on closure, even if older callers still invoke it.
+    return {
+        "wall_topology": "source-image-preserved",
+        "added_wall_caps": 0,
+        "closed_wall_polylines": sum(
+            1 for entity in msp
+            if entity.dxftype() == "LWPOLYLINE"
+            and entity.dxf.layer in WALL_LAYERS
+            and entity.closed
+        ),
+        "remaining_wall_lines": sum(
+            1 for entity in msp
+            if entity.dxftype() == "LINE" and entity.dxf.layer in WALL_LAYERS
+        ),
+    }
+
     line_entities = [
         entity
         for entity in msp
@@ -837,6 +854,38 @@ def load_preprocessing_evidence(path: Path | None) -> dict | None:
     }
 
 
+def load_preprocessing_windows(path: Path | None) -> list[PixelWindow]:
+    if path is None or not path.exists():
+        return []
+    data = json.loads(path.read_text(encoding="utf-8"))
+    result: list[PixelWindow] = []
+    for item in data.get("windows", []):
+        box = item.get("bbox") or {}
+        x = float(box.get("x", 0))
+        y = float(box.get("y", 0))
+        width = float(box.get("width", 0))
+        height = float(box.get("height", 0))
+        orientation = item.get("orientation")
+        if width <= 0 or height <= 0 or orientation not in {"horizontal", "vertical"}:
+            continue
+        if orientation == "horizontal":
+            start, end = x, x + width
+            face1, face2 = y, y + height
+        else:
+            start, end = y, y + height
+            face1, face2 = x, x + width
+        result.append(PixelWindow(
+            orientation=orientation,
+            start=start,
+            end=end,
+            face1=face1,
+            center=(face1 + face2) / 2.0,
+            face2=face2,
+            confidence=float(item.get("confidence", 0.5)),
+        ))
+    return result
+
+
 def generate(
     source: Path,
     wall_dxf: Path,
@@ -855,6 +904,10 @@ def generate(
     pixel_windows, mask = detect_windows(
         gray, plan_bbox, overall_width_mm, overall_height_mm, wall_widths
     )
+    preprocessing_fallback = False
+    if not pixel_windows:
+        pixel_windows = load_preprocessing_windows(preprocessing_result)
+        preprocessing_fallback = bool(pixel_windows)
     stage_issues: list[str] = []
     if not pixel_windows:
         stage_issues.append("未找到满足窗户几何规则的候选；保留原墙体并继续流程")
@@ -928,11 +981,9 @@ def generate(
     if not accepted:
         stage_issues.append("窗户候选全部被墙体匹配规则拒绝；保留原墙体并继续流程")
 
-    try:
-        wall_topology = rebuild_closed_wall_polylines(msp, maximum_closure_mm=max(wall_widths) + 1.0)
-    except RuntimeError as error:
-        stage_issues.append(f"墙体拓扑校核未通过：{error}")
-        wall_topology = {"wall_topology": "needs_repair", "topology_error": str(error)}
+    # Preserve the source wall geometry. Wall closure is neither rebuilt nor
+    # used as a gate for window entity generation.
+    wall_topology = {"wall_topology": "source-image-preserved"}
     final_wall_overlaps = sum(count_wall_overlaps(msp, item) for item in accepted)
     if final_wall_overlaps:
         stage_issues.append(f"闭合墙体重建后，窗洞范围内仍有 {final_wall_overlaps} 条墙体边界")
@@ -951,7 +1002,11 @@ def generate(
         "detector": "two-window-inner-lines-with-two-wall-faces-and-endcaps",
         "preprocessing_evidence": load_preprocessing_evidence(preprocessing_result),
         "pixel_candidates": len(pixel_windows),
+        "preprocessing_candidate_fallback": preprocessing_fallback,
         "accepted_windows": len(accepted),
+        "accepted_image_only_windows": sum(
+            1 for item in records if item.get("status") == "ACCEPTED_IMAGE_ONLY"
+        ),
         "rejected_windows": len(records) - len(accepted),
         "converted_wall_polylines": converted_polylines,
         "windows": records,
