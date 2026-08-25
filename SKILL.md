@@ -20,8 +20,13 @@ description: 根据户型图片分阶段识别并生成具有真实墙厚的墙�
 图片输入必须先运行：
 `python scripts/processing.py <输入图片> --output-dir <预处理输出目录>`
 然后读取该目录中的 `result.json`、`overlay.png`、`masks/walls.png`、`masks/doors.png`、`masks/windows.png`、`masks/dimensions.png`、`masks/room_labels.png` 和 `masks/other.png`。OCR 不可用时，text=null 的候选不得视为确定文字。
+
+### 2.1b 图例先验加载
+进入多模态识别前，必须先读取 `references/README.md`，并加载同目录下与类别对应的图例图片。当前图例文件为：`wall_legend.jpg`（墙体涂实）、`door_legend.jpg`（平开门及圆弧开启方向）、`window_legend.jpg`（普通窗及两条窗框线）、`sliding_door_legend.jpg`（推拉门及两扇搭接门板）、`wall_corner_legend.jpg`（墙角连接）、`window_corner_legend.jpg`（窗角连接）和 `annotated_floorplan_example.jpg`（完整户型图标注示例）。
+
+图例只作为多模态分类和 OpenCV 分流的视觉先验，不得直接转换为 CAD 坐标，也不得覆盖当前户型图中的实际证据。识别时必须将图例中的符号与原图候选进行相似性比对，并结合墙体 ROI、像素位置、方向、拓扑关系和尺寸证据；图例与原图冲突时保留冲突记录并降低置信度。缺少某张图例时继续使用其余图例，不得因此中断整个流程。
 ### 2.1a 多模态识别与 OpenCV 分流
-在进入墙、窗、门几何生成前，必须建立多模态候选层。多模态输入可以是当前对话中的户型图视觉识别结果，也可以是兼容本 Skill 数据契约的 JSON；不得把自然语言描述直接当作 CAD 坐标。
+在进入墙、窗、门几何生成前，必须建立多模态候选层。多模态输入可以是当前对话中的户型图视觉识别结果，也可以是兼容本 Skill 数据契约的 JSON；不得把自然语言描述直接当作 CAD 坐标。多模态识别必须参考 `2.1b 图例先验加载` 中的实际图例，但最终候选仍以当前户型图为准。
 
 多模态识别至少输出 `multimodal.json`，每个候选包含：`id`、`class`（`wall`/`window`/`door`）、`bbox_px` 或 `polygon_px`、`orientation`（可空）、`attributes`、`confidence`、`status`（`DETECTED`/`INFERRED`/`UNCERTAIN`）和 `reason`。墙体候选还应给出 `wall_role`；门候选应给出 `door_type`、`hinge_side`、`swing_direction`（不确定可空）；窗候选应给出 `window_type`。
 
