@@ -44,6 +44,7 @@ class PixelWindow:
     center: float
     face2: float
     confidence: float
+    evidence_line_count: int = 4
 
 
 @dataclass(frozen=True)
@@ -55,6 +56,7 @@ class CadWindow:
     face2: float
     confidence: float
     source: str = "DETECTED"
+    evidence_line_count: int = 4
 
     @property
     def width(self) -> float:
@@ -63,6 +65,29 @@ class CadWindow:
     @property
     def wall_width(self) -> float:
         return self.face2 - self.face1
+
+
+def identify_corner_window_groups(
+    windows: Sequence[CadWindow], tolerance: float
+) -> list[dict]:
+    horizontal = [item for item in windows if item.orientation == "horizontal"]
+    vertical = [item for item in windows if item.orientation == "vertical"]
+    groups: list[dict] = []
+    for first in horizontal:
+        first_axis = (first.face1 + first.face2) / 2.0
+        for second in vertical:
+            second_axis = (second.face1 + second.face2) / 2.0
+            x_error = min(abs(first.start - second_axis), abs(first.end - second_axis))
+            y_error = min(abs(second.start - first_axis), abs(second.end - first_axis))
+            if x_error <= tolerance and y_error <= tolerance:
+                groups.append({
+                    "type": "corner_window",
+                    "horizontal": asdict(first),
+                    "vertical": asdict(second),
+                    "corner": [round(second_axis, 3), round(first_axis, 3)],
+                    "status": "DETECTED_L_SHAPED_FRAME",
+                })
+    return groups
 
 
 def read_gray(path: Path) -> np.ndarray:
@@ -866,7 +891,13 @@ def load_preprocessing_windows(path: Path | None) -> list[PixelWindow]:
         width = float(box.get("width", 0))
         height = float(box.get("height", 0))
         orientation = item.get("orientation")
-        if width <= 0 or height <= 0 or orientation not in {"horizontal", "vertical"}:
+        evidence_line_count = int(item.get("evidence_line_count", 0))
+        if (
+            width <= 0
+            or height <= 0
+            or orientation not in {"horizontal", "vertical"}
+            or evidence_line_count != 4
+        ):
             continue
         if orientation == "horizontal":
             start, end = x, x + width
@@ -882,8 +913,48 @@ def load_preprocessing_windows(path: Path | None) -> list[PixelWindow]:
             center=(face1 + face2) / 2.0,
             face2=face2,
             confidence=float(item.get("confidence", 0.5)),
+            evidence_line_count=4,
         ))
     return result
+
+
+def suppress_windows_in_door_arc_regions(
+    windows: Sequence[PixelWindow], path: Path | None
+) -> tuple[list[PixelWindow], list[dict]]:
+    if path is None or not path.exists():
+        return list(windows), []
+    data = json.loads(path.read_text(encoding="utf-8"))
+    door_boxes = [item.get("bbox") or {} for item in data.get("doors", [])]
+    kept: list[PixelWindow] = []
+    suppressed: list[dict] = []
+    for window in windows:
+        if window.orientation == "horizontal":
+            wx1, wy1, wx2, wy2 = window.start, window.face1, window.end, window.face2
+        else:
+            wx1, wy1, wx2, wy2 = window.face1, window.start, window.face2, window.end
+        window_area = max((wx2 - wx1) * (wy2 - wy1), 1.0)
+        matched = None
+        for box in door_boxes:
+            dx1 = float(box.get("x", 0))
+            dy1 = float(box.get("y", 0))
+            dx2 = dx1 + float(box.get("width", 0))
+            dy2 = dy1 + float(box.get("height", 0))
+            overlap = max(0.0, min(wx2, dx2) - max(wx1, dx1)) * max(
+                0.0, min(wy2, dy2) - max(wy1, dy1)
+            )
+            center_inside = dx1 <= (wx1 + wx2) / 2.0 <= dx2 and dy1 <= (wy1 + wy2) / 2.0 <= dy2
+            if center_inside or overlap / window_area >= 0.15:
+                matched = box
+                break
+        if matched is None:
+            kept.append(window)
+        else:
+            suppressed.append({
+                "window": asdict(window),
+                "door_arc_bbox": matched,
+                "reason": "门弧候选区域优先，不允许同位置生成窗",
+            })
+    return kept, suppressed
 
 
 def generate(
@@ -908,6 +979,9 @@ def generate(
     if not pixel_windows:
         pixel_windows = load_preprocessing_windows(preprocessing_result)
         preprocessing_fallback = bool(pixel_windows)
+    pixel_windows, door_arc_suppressed = suppress_windows_in_door_arc_regions(
+        pixel_windows, preprocessing_result
+    )
     stage_issues: list[str] = []
     if not pixel_windows:
         stage_issues.append("未找到满足窗户几何规则的候选；保留原墙体并继续流程")
@@ -1003,9 +1077,14 @@ def generate(
         "preprocessing_evidence": load_preprocessing_evidence(preprocessing_result),
         "pixel_candidates": len(pixel_windows),
         "preprocessing_candidate_fallback": preprocessing_fallback,
+        "door_arc_suppressed_windows": door_arc_suppressed,
+        "door_arc_suppressed_window_count": len(door_arc_suppressed),
         "accepted_windows": len(accepted),
         "accepted_image_only_windows": sum(
             1 for item in records if item.get("status") == "ACCEPTED_IMAGE_ONLY"
+        ),
+        "corner_window_groups": identify_corner_window_groups(
+            accepted, tolerance=max(wall_widths) * 2.0
         ),
         "rejected_windows": len(records) - len(accepted),
         "converted_wall_polylines": converted_polylines,

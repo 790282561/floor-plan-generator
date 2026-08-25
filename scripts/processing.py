@@ -13,6 +13,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+from itertools import combinations
 import json
 import math
 import shutil
@@ -60,6 +61,8 @@ class Opening:
     bbox: Box
     orientation: str
     confidence: float
+    evidence_line_count: int = 0
+    evidence_type: str = "unknown"
 
 
 @dataclass
@@ -350,23 +353,31 @@ def detect_windows(
     near_wall = cv2.dilate(wall_mask, np.ones((25, 25), np.uint8))
 
     def collect(groups: list[tuple[int, int, int]], orientation: str) -> None:
-        for i, first in enumerate(groups):
-            a1, a2, axis1 = first
-            for second in groups[i + 1 :]:
-                b1, b2, axis2 = second
-                spacing = abs(axis1 - axis2)
-                overlap1, overlap2 = max(a1, b1), min(a2, b2)
-                overlap = overlap2 - overlap1
-                if not (2 <= spacing <= 14 and overlap >= 14):
-                    continue
-                if orientation == "horizontal":
-                    box = Box(overlap1, min(axis1, axis2) - 2, overlap, spacing + 5)
-                else:
-                    box = Box(min(axis1, axis2) - 2, overlap1, spacing + 5, overlap)
-                clipped = clip_box(box, width, height, padding=4)
-                region = near_wall[clipped.y : clipped.y2, clipped.x : clipped.x2]
-                if region.size and np.count_nonzero(region) / region.size >= 0.08:
-                    candidates.append(Opening(box, orientation, 0.72))
+        # A window is exactly four substantially coextensive parallel lines:
+        # two wall/window faces and two inner frame lines. Pairs or triples are
+        # not window evidence.
+        ordered = sorted(groups, key=lambda item: item[2])
+        for quartet in combinations(ordered, 4):
+            axes = [item[2] for item in quartet]
+            if len(set(axes)) != 4:
+                continue
+            span = max(axes) - min(axes)
+            gaps = [right - left for left, right in zip(axes, axes[1:])]
+            if not (5 <= span <= 36 and all(1 <= gap <= 16 for gap in gaps)):
+                continue
+            overlap1 = max(item[0] for item in quartet)
+            overlap2 = min(item[1] for item in quartet)
+            overlap = overlap2 - overlap1
+            if overlap < 14:
+                continue
+            if orientation == "horizontal":
+                box = Box(overlap1, min(axes) - 2, overlap, span + 5)
+            else:
+                box = Box(min(axes) - 2, overlap1, span + 5, overlap)
+            clipped = clip_box(box, width, height, padding=4)
+            region = near_wall[clipped.y : clipped.y2, clipped.x : clipped.x2]
+            if region.size and np.count_nonzero(region) / region.size >= 0.08:
+                candidates.append(Opening(box, orientation, 0.9, 4, "four_parallel_lines"))
 
     collect(horizontal, "horizontal")
     collect(vertical, "vertical")
@@ -381,7 +392,7 @@ def detect_windows(
         )
         if length < 18 or length / max(thickness, 1) < 1.8:
             continue
-        windows.append(Opening(box, orientation, 0.72))
+        windows.append(Opening(box, orientation, 0.9, 4, "four_parallel_lines"))
         mask_box(window_mask, clip_box(box, width, height, padding=2))
     return cv2.bitwise_and(window_mask, thin_ink), windows
 
@@ -644,8 +655,34 @@ def process_floor_plan(
     thin_ink = ink.copy()
     thin_ink[cv2.dilate(wall_mask, np.ones((3, 3), np.uint8)) > 0] = 0
 
+    # Door arcs are stronger semantic evidence than parallel window strokes.
+    # Detect doors without masking possible window regions, then remove every
+    # window candidate occupying a detected door-arc box.
+    door_mask, doors = detect_doors(gray, wall_mask, plan_box, np.zeros_like(gray))
     window_mask, windows = detect_windows(thin_ink, wall_mask, plan_box)
-    door_mask, doors = detect_doors(gray, wall_mask, plan_box, window_mask)
+    filtered_windows: list[Opening] = []
+    window_mask = np.zeros_like(gray)
+    for window in windows:
+        box = window.bbox
+        area = max(box.width * box.height, 1)
+        conflicts_with_door = False
+        for door in doors:
+            door_box = door.bbox
+            overlap_width = max(0, min(box.x2, door_box.x2) - max(box.x, door_box.x))
+            overlap_height = max(0, min(box.y2, door_box.y2) - max(box.y, door_box.y))
+            center_inside = (
+                door_box.x <= box.x + box.width / 2 <= door_box.x2
+                and door_box.y <= box.y + box.height / 2 <= door_box.y2
+            )
+            if center_inside or overlap_width * overlap_height / area >= 0.15:
+                conflicts_with_door = True
+                break
+        if conflicts_with_door:
+            continue
+        filtered_windows.append(window)
+        mask_box(window_mask, clip_box(box, gray.shape[1], gray.shape[0], padding=2))
+    windows = filtered_windows
+    window_mask = cv2.bitwise_and(window_mask, thin_ink)
 
     residual = thin_ink.copy()
     residual[window_mask > 0] = 0

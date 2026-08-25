@@ -858,6 +858,27 @@ def overlaps_window(msp, door: CadDoor, tolerance: float = 20.0) -> bool:
     return False
 
 
+def remove_windows_overlapping_door(msp, door: CadDoor, tolerance: float = 20.0) -> int:
+    """Door-arc evidence has priority; remove window frames at the same opening."""
+    removed = 0
+    for entity in list(msp):
+        if entity.dxftype() != "LWPOLYLINE" or entity.dxf.layer != WINDOW_LAYER:
+            continue
+        points = [(float(x), float(y)) for x, y in entity.get_points("xy")]
+        if not points:
+            continue
+        xs = [point[0] for point in points]
+        ys = [point[1] for point in points]
+        if door.orientation == "horizontal":
+            overlaps = min(max(xs), door.end) - max(min(xs), door.start) > tolerance and min(max(ys), door.face2) - max(min(ys), door.face1) > tolerance
+        else:
+            overlaps = min(max(ys), door.end) - max(min(ys), door.start) > tolerance and min(max(xs), door.face2) - max(min(xs), door.face1) > tolerance
+        if overlaps:
+            msp.delete_entity(entity)
+            removed += 1
+    return removed
+
+
 def cad_leaf_angles(leaf: PixelLeaf) -> tuple[float, float, float]:
     image_start = leaf.quadrant_start_image_deg
     image_end = (image_start + 90) % 360
@@ -1311,6 +1332,7 @@ def generate(
                 # Preserve a detected door even when wall matching fails.
                 # Its image-mapped geometry is more faithful than silently
                 # dropping the candidate; the mismatch is reported.
+                removed_misclassified_windows = remove_windows_overlapping_door(msp, raw)
                 geometry = (
                     add_sliding_geometry(msp, raw)
                     if raw.kind == "sliding"
@@ -1323,6 +1345,7 @@ def generate(
                     "reason": reason,
                     "pixel": asdict(pixel),
                     "mapped_cad": asdict(raw),
+                    "removed_misclassified_windows": removed_misclassified_windows,
                     "geometry": geometry,
                 })
                 continue
@@ -1334,15 +1357,7 @@ def generate(
                 "mapped_cad": asdict(raw) if raw is not None else None,
             })
             continue
-        if overlaps_window(msp, normalized):
-            records.append({
-                "id": f"D{index:02d}",
-                "status": "REJECTED",
-                "reason": "门洞与已生成窗户重叠",
-                "pixel": asdict(pixel),
-                "mapped_cad": asdict(normalized),
-            })
-            continue
+        removed_misclassified_windows = remove_windows_overlapping_door(msp, normalized)
         if any(
             old.orientation == normalized.orientation
             and abs((old.face1 + old.face2) - (normalized.face1 + normalized.face2)) <= 8.0
@@ -1387,6 +1402,7 @@ def generate(
             "cut_wall_entities": changed,
             "wall_overlaps_before": before,
             "wall_overlaps_after": after,
+            "removed_misclassified_windows": removed_misclassified_windows,
             "geometry": geometry,
         })
 
