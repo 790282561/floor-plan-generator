@@ -679,10 +679,13 @@ def write_preview(
 def generate(source: Path, output: Path) -> dict:
     gray = read_gray(source)
     lines, polylines, stats = extract_wall_geometry(gray)
+    stage_issues: list[str] = []
     if lines:
-        raise RuntimeError("墙体重建后仍存在独立 LINE，已停止输出")
+        stage_issues.append(
+            f"墙体重建后仍存在 {len(lines)} 条独立 LINE；保留中间结果并继续后续阶段"
+        )
     if not polylines:
-        raise RuntimeError("未提取到闭合墙体多段线")
+        stage_issues.append("未提取到闭合墙体多段线；保留空/部分 DXF 并继续后续阶段")
 
     doc = ezdxf.new("R2010", setup=True)
     doc.units = ezdxf.units.MM
@@ -726,7 +729,7 @@ def generate(source: Path, output: Path) -> dict:
         and len(auditor.errors) == 0
     )
     if not wall_geometry_valid:
-        raise RuntimeError(
+        stage_issues.append(
             "墙体闭合校核失败："
             f"LINE={wall_lines}, OPEN_LWPOLYLINE={open_wall_polylines}, "
             f"CLOSED_LWPOLYLINE={closed_wall_polylines}, AUDIT_ERRORS={len(auditor.errors)}"
@@ -749,6 +752,8 @@ def generate(source: Path, output: Path) -> dict:
         "wall_geometry_valid": wall_geometry_valid,
         "audit_errors": len(auditor.errors),
         "audit_fixes": len(auditor.fixes),
+        "stage_status": "needs_repair" if stage_issues else "ready",
+        "repair_queue": stage_issues,
         **stats,
     }
     output.with_suffix(".json").write_text(
