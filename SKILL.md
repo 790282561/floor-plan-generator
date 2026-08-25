@@ -20,6 +20,14 @@ description: 根据户型图片分阶段识别并生成具有真实墙厚的墙�
 图片输入必须先运行：
 `python scripts/processing.py <输入图片> --output-dir <预处理输出目录>`
 然后读取该目录中的 `result.json`、`overlay.png`、`masks/walls.png`、`masks/doors.png`、`masks/windows.png`、`masks/dimensions.png`、`masks/room_labels.png` 和 `masks/other.png`。OCR 不可用时，text=null 的候选不得视为确定文字。
+### 2.1a 多模态识别与 OpenCV 分流
+在进入墙、窗、门几何生成前，必须建立多模态候选层。多模态输入可以是当前对话中的户型图视觉识别结果，也可以是兼容本 Skill 数据契约的 JSON；不得把自然语言描述直接当作 CAD 坐标。
+
+多模态识别至少输出 `multimodal.json`，每个候选包含：`id`、`class`（`wall`/`window`/`door`）、`bbox_px` 或 `polygon_px`、`orientation`（可空）、`attributes`、`confidence`、`status`（`DETECTED`/`INFERRED`/`UNCERTAIN`）和 `reason`。墙体候选还应给出 `wall_role`；门候选应给出 `door_type`、`hinge_side`、`swing_direction`（不确定可空）；窗候选应给出 `window_type`。
+
+随后由 OpenCV 按类别分别处理：`walls` 只生成墙体 mask、中心线/双边界和墙厚候选；`windows` 只在墙体 ROI 内寻找窗洞/窗框；`doors` 只在墙体 ROI 内寻找门洞、门扇和开启弧。每类结果分别写入 `opencv_candidates`，保留像素坐标和证据来源，禁止不同类别共用一个未经分类的轮廓。
+
+融合规则：同类且 IoU >= 0.35 的候选合并；多模态与 OpenCV 几何一致时提高置信度，不一致时保留冲突记录并降为 `UNCERTAIN`。`confidence >= 0.85` 且无拓扑冲突才可自动进入对应生成脚本；`0.65–0.85` 必须局部复核；低于 `0.65` 或类别冲突必须进入 `UncertainObject`。多模态层只提供识别证据，不绕过现有 CAD 生成脚本。
 ### 2.2 建筑外轮廓识别
 识别整体边界、凹凸关系、转角、阳台、露台、门廊和附属空间，建立建筑外轮廓。
 ### 2.3 墙体识别
@@ -67,6 +75,9 @@ description: 根据户型图片分阶段识别并生成具有真实墙厚的墙�
 包含 id、name、x、y、width、height、boundary_walls、label_position、text_height、text_style、source 和 confidence；房间应由墙体围合形成闭合空间。`name` 必须与图片明确文字或用户要求一致。
 ### 3.6 UncertainObject
 记录模糊、重叠或无法确认的墙体、门窗、文字和尺寸候选，包含 geometry、reason、confidence 和 INFERRED 状态。
+
+### 3.7 MultimodalCandidate
+包含 `id`、`class`、`bbox_px`/`polygon_px`、`attributes`、`source`、`confidence`、`status`、`opencv_evidence_ids` 和 `conflict_ids`。该对象用于把图像语义识别稳定地交给 OpenCV 分类别提取，不能直接作为 DXF 实体。
 
 ## 4. 信息可信度
 ### 4.1 USER
@@ -116,9 +127,10 @@ description: 根据户型图片分阶段识别并生成具有真实墙厚的墙�
 ### 图片输入流程
 
 1. 预处理：`python scripts/processing.py <source.png> --output-dir <preprocessed>`
-2. 墙体生成：`python scripts/generate_by_pic.py <source.png> <walls.dxf> --data scripts/data.json --overall-width-mm <总宽> --overall-height-mm <总高> --wall-bbox <x1> <y1> <x2> <y2> --horizontal-chain-mm <横向尺寸链> --vertical-chain-top-down-mm <纵向尺寸链>`
-3. 窗户生成：`python scripts/generate_windows.py <含窗图片> <walls.dxf> <walls_windows.dxf> --data scripts/data.json --overall-width-mm <总宽> --overall-height-mm <总高> --image-wall-bbox <x1> <y1> <x2> <y2> --preprocessing-result <preprocessed/result.json>`
-4. 门生成：`python scripts/generate_doors.py <含门图片> <上一阶段图片> <walls_windows.dxf> <final.dxf> --data scripts/data.json --overall-width-mm <总宽> --overall-height-mm <总高> --image-wall-bbox <x1> <y1> <x2> <y2> --preprocessing-result <preprocessed/result.json>`
+2. 多模态/OpenCV 融合：`python scripts/multimodal_fusion.py <source.png> --preprocessed-dir <preprocessed> --output <preprocessed/multimodal.json>`；读取 `multimodal.json`，按 `wall`、`window`、`door` 分流并处理冲突。
+3. 墙体生成：`python scripts/generate_by_pic.py <source.png> <walls.dxf> --data scripts/data.json --overall-width-mm <总宽> --overall-height-mm <总高> --wall-bbox <x1> <y1> <x2> <y2> --horizontal-chain-mm <横向尺寸链> --vertical-chain-top-down-mm <纵向尺寸链>`
+4. 窗户生成：`python scripts/generate_windows.py <含窗图片> <walls.dxf> <walls_windows.dxf> --data scripts/data.json --overall-width-mm <总宽> --overall-height-mm <总高> --image-wall-bbox <x1> <y1> <x2> <y2> --preprocessing-result <preprocessed/result.json>`
+5. 门生成：`python scripts/generate_doors.py <含门图片> <上一阶段图片> <walls_windows.dxf> <final.dxf> --data scripts/data.json --overall-width-mm <总宽> --overall-height-mm <总高> --image-wall-bbox <x1> <y1> <x2> <y2> --preprocessing-result <preprocessed/result.json>`
 
 墙体脚本输出的 DXF 和 JSON 报告必须先校核通过，才能传给 `generate_windows.py`；窗户脚本输出的 DXF 和 JSON 报告必须先校核通过，才能传给 `generate_doors.py`。尺寸链、总宽、总高和墙体外框不能凭空填写，必须来自用户、图纸标注或经过复核的图像测量。
 
