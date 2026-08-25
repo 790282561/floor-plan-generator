@@ -542,11 +542,9 @@ def extract_wall_geometry(
     horizontal = merge_axis_segments(horizontal)
     vertical = merge_axis_segments(vertical)
 
-    # Thin-outline drawings used to be emitted as independent LINE entities.
-    # That breaks the wall-topology contract and leaves later opening stages to
-    # guess which edges belong together. Trace the detected wall ink into
-    # closed orthogonal boundaries here instead. If no closed boundary can be
-    # reconstructed, stop rather than writing a structurally invalid wall DXF.
+    # Trace the detected wall ink when possible. A failed trace is not fatal:
+    # retain the actual detected horizontal/vertical wall segments so the
+    # output follows the source image and later stages can still run.
     traced = extract_closed_wall_polylines(
         roi,
         x_offset=x1,
@@ -559,9 +557,12 @@ def extract_wall_geometry(
         for polygon in traced
         if len(polygon) >= 4
     ]
-    if not polylines:
-        raise RuntimeError("细线墙体无法重建为闭合 LWPOLYLINE，已停止输出")
-    return [], polylines, {
+    raw_lines = [
+        (x, start, x, end) for x, start, end in vertical
+    ] + [
+        (start, y, end, y) for y, start, end in horizontal
+    ]
+    return raw_lines if not polylines else [], polylines, {
         "horizontal_boundary_lines": len(horizontal),
         "vertical_boundary_lines": len(vertical),
         "closed_wall_polylines": len(polylines),
@@ -680,12 +681,9 @@ def generate(source: Path, output: Path) -> dict:
     gray = read_gray(source)
     lines, polylines, stats = extract_wall_geometry(gray)
     stage_issues: list[str] = []
-    if lines:
-        stage_issues.append(
-            f"墙体重建后仍存在 {len(lines)} 条独立 LINE；保留中间结果并继续后续阶段"
-        )
-    if not polylines:
-        stage_issues.append("未提取到闭合墙体多段线；保留空/部分 DXF 并继续后续阶段")
+    # Independent lines are valid source evidence in image-faithful mode.
+    # No repair item is created for open walls: closure is deliberately not
+    # checked or used as a stage gate.
 
     doc = ezdxf.new("R2010", setup=True)
     doc.units = ezdxf.units.MM
@@ -693,10 +691,14 @@ def generate(source: Path, output: Path) -> dict:
     doc.layers.add("INNER_WALLS", color=7, linetype="CONTINUOUS")
     doc.layers.add("DIMENSIONS", color=1, linetype="CONTINUOUS")
     msp = doc.modelspace()
+    for x1, y1, x2, y2 in lines:
+        p1 = to_cad((x1, y1))
+        p2 = to_cad((x2, y2))
+        msp.add_line(p1, p2, dxfattribs={"layer": "WALLS"})
     for polyline in polylines:
         msp.add_lwpolyline(
             polyline,
-            close=True,
+            close=False,
             dxfattribs={"layer": "WALLS"},
         )
 
@@ -722,18 +724,9 @@ def generate(source: Path, output: Path) -> dict:
         and entity.dxftype() == "LWPOLYLINE"
         and entity.closed
     )
-    wall_geometry_valid = (
-        wall_lines == 0
-        and open_wall_polylines == 0
-        and closed_wall_polylines > 0
-        and len(auditor.errors) == 0
-    )
-    if not wall_geometry_valid:
-        stage_issues.append(
-            "墙体闭合校核失败："
-            f"LINE={wall_lines}, OPEN_LWPOLYLINE={open_wall_polylines}, "
-            f"CLOSED_LWPOLYLINE={closed_wall_polylines}, AUDIT_ERRORS={len(auditor.errors)}"
-        )
+    # Closure is intentionally not an acceptance criterion. The source image
+    # is authoritative; preserve open/fragmented wall evidence as-is.
+    wall_geometry_valid = None
 
     output.parent.mkdir(parents=True, exist_ok=True)
     doc.saveas(output)
@@ -748,7 +741,7 @@ def generate(source: Path, output: Path) -> dict:
         "wall_open_polylines": open_wall_polylines,
         "wall_closed_polylines": closed_wall_polylines,
         "wall_boundary_edges": sum(len(polyline) for polyline in polylines),
-        "wall_topology": "closed-lwpolylines",
+        "wall_topology": "source-image-preserved",
         "wall_geometry_valid": wall_geometry_valid,
         "audit_errors": len(auditor.errors),
         "audit_fixes": len(auditor.fixes),

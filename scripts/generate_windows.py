@@ -872,10 +872,16 @@ def generate(
         raw = to_cad_window(pixel, plan_bbox, overall_width_mm, overall_height_mm)
         normalized, reason = normalize_window_to_wall(raw, msp, wall_widths)
         if normalized is None:
+            # The image candidate remains authoritative even when the current
+            # wall geometry cannot provide a usable pair of faces. Draw the
+            # window in image-mapped CAD coordinates and keep the mismatch in
+            # the report instead of dropping the detected window.
+            add_window_geometry(msp, raw)
+            accepted.append(raw)
             records.append(
                 {
                     "id": f"W{index:02d}",
-                    "status": "REJECTED",
+                    "status": "ACCEPTED_IMAGE_ONLY",
                     "reason": reason,
                     "pixel": asdict(pixel),
                     "mapped_cad": asdict(raw),

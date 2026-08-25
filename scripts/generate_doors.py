@@ -1142,6 +1142,25 @@ def generate(
             normalized, reason = None, str(error)
             raw = None
         if normalized is None:
+            if raw is not None:
+                # Preserve a detected door even when wall matching fails.
+                # Its image-mapped geometry is more faithful than silently
+                # dropping the candidate; the mismatch is reported.
+                geometry = (
+                    add_sliding_geometry(msp, raw)
+                    if raw.kind == "sliding"
+                    else add_swing_geometry(msp, raw, pixel, plan_bbox, overall_width_mm, overall_height_mm)
+                )
+                accepted.append(raw)
+                records.append({
+                    "id": f"D{index:02d}",
+                    "status": "ACCEPTED_IMAGE_ONLY",
+                    "reason": reason,
+                    "pixel": asdict(pixel),
+                    "mapped_cad": asdict(raw),
+                    "geometry": geometry,
+                })
+                continue
             records.append({
                 "id": f"D{index:02d}",
                 "status": "REJECTED",
