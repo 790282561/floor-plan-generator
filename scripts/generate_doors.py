@@ -1099,8 +1099,9 @@ def generate(
     wall_widths = load_wall_widths(data_path)
     plan_bbox = image_wall_bbox or detect_plan_bbox(previous_gray)
     pixel_doors, door_mask, rejected_components = detect_doors(source_gray, previous_gray, plan_bbox)
+    stage_issues: list[str] = []
     if not pixel_doors:
-        raise RuntimeError("差分图中未找到满足规则的平开门或推拉门")
+        stage_issues.append("差分图中未找到满足规则的平开门或推拉门；保留上一阶段图形并继续流程")
 
     doc = ezdxf.readfile(wall_window_dxf)
     doc.units = ezdxf.units.MM
@@ -1206,15 +1207,18 @@ def generate(
         })
 
     if not accepted:
-        raise RuntimeError("门候选全部被墙体匹配规则拒绝")
-    wall_topology = rebuild_closed_wall_polylines(msp, max(wall_widths) + 1.0)
+        stage_issues.append("门候选全部被墙体匹配规则拒绝；保留上一阶段图形并继续流程")
+    try:
+        wall_topology = rebuild_closed_wall_polylines(msp, max(wall_widths) + 1.0)
+    except RuntimeError as error:
+        stage_issues.append(f"墙体拓扑校核未通过：{error}")
+        wall_topology = {"wall_topology": "needs_repair", "topology_error": str(error)}
     final_overlaps = sum(count_wall_overlaps(msp, door) for door in accepted)
     if final_overlaps:
-        raise RuntimeError(f"闭合墙体重建后门洞内仍有 {final_overlaps} 条墙体边界")
+        stage_issues.append(f"闭合墙体重建后门洞内仍有 {final_overlaps} 条墙体边界")
     door_geometry_collisions = validate_door_geometry(msp)
     if door_geometry_collisions:
-        sample = door_geometry_collisions[:3]
-        raise RuntimeError(f"门线与墙体或窗线相交（共 {len(door_geometry_collisions)} 处），示例：{sample}")
+        stage_issues.append(f"门线与墙体或窗线相交（共 {len(door_geometry_collisions)} 处）")
     output.parent.mkdir(parents=True, exist_ok=True)
     doc.saveas(output)
     auditor = doc.audit()
@@ -1248,6 +1252,8 @@ def generate(
         "audit_errors": len(auditor.errors),
         "audit_fixes": len(auditor.fixes),
         "target_cad_visual_check": False,
+        "stage_status": "needs_repair" if stage_issues else "ready",
+        "repair_queue": stage_issues,
     }
     output.with_suffix(".json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     write_detection_artifacts(source_gray, door_mask, plan_bbox, pixel_doors, output)

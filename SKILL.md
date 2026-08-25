@@ -55,7 +55,7 @@ description: 根据户型图片分阶段识别并生成具有真实墙厚的墙�
 ### 2.14 脚本驱动的 CAD 生成
 不得直接由 Skill 手工绘制图形，必须按图片阶段调用对应脚本：预处理调用 `processing.py`，墙体调用 `generate_by_pic.py`，窗户调用 `generate_windows.py`，门调用 `generate_doors.py`。各阶段的 DXF 输出必须作为下一阶段的输入。
 ### 2.15 绘后检查
-每个生成脚本都必须读取其输出的同名 JSON 报告并完成阶段验收：墙体阶段记录 `wall_geometry_valid`、`wall_boundary_lines`、`wall_open_polylines`、`wall_closed_polylines` 和 `audit_errors`；窗户阶段记录 `accepted_windows`、`topology.wall_overlaps_after` 和 `audit_errors`；门阶段记录 `accepted_doors`、`topology.wall_overlaps_after`、`topology.door_geometry_collision_count` 和 `audit_errors`。墙体不封闭、存在开放折线或审计问题时，不得结束整个流程：必须保留当前 DXF/PNG/JSON，写入 `repair_queue`，标记 `stage_status: needs_repair`，并继续执行可独立进行的窗、门候选识别和报告生成。只有在最终交付前，才将未修复问题作为阻断项，不得宣称 CAD 几何合格。静态验收通过后仍需检查 PNG 预览和目标 CAD 实际显示。
+每个生成脚本都必须读取其输出的同名 JSON 报告并完成阶段验收：墙体阶段记录 `wall_geometry_valid`、`wall_boundary_lines`、`wall_open_polylines`、`wall_closed_polylines` 和 `audit_errors`；窗户阶段记录 `accepted_windows`、`topology.wall_overlaps_after` 和 `audit_errors`；门阶段记录 `accepted_doors`、`topology.wall_overlaps_after`、`topology.door_geometry_collision_count` 和 `audit_errors`。无论原图窗线、门线、候选为空、候选被拒绝、墙体不封闭、存在开放折线或审计问题，均不得中途停止计算：必须保留当前 DXF/PNG/JSON，写入 `repair_queue`，标记 `stage_status: needs_repair`，并继续后续阶段和报告生成。只有输入不可读、输出无法写入或数据损坏等致命错误才允许结束进程。最终交付前再将未修复问题作为阻断项，不得宣称 CAD 几何合格。
 ### 2.16 局部纠错
 只修改对应局部对象，并重新检查相邻墙体、门窗、房间和尺寸关系。不得因局部纠错改变无关区域。
 
@@ -132,7 +132,7 @@ description: 根据户型图片分阶段识别并生成具有真实墙厚的墙�
 4. 窗户生成：`python scripts/generate_windows.py <含窗图片> <walls.dxf> <walls_windows.dxf> --data scripts/data.json --overall-width-mm <总宽> --overall-height-mm <总高> --image-wall-bbox <x1> <y1> <x2> <y2> --preprocessing-result <preprocessed/result.json>`
 5. 门生成：`python scripts/generate_doors.py <含门图片> <上一阶段图片> <walls_windows.dxf> <final.dxf> --data scripts/data.json --overall-width-mm <总宽> --overall-height-mm <总高> --image-wall-bbox <x1> <y1> <x2> <y2> --preprocessing-result <preprocessed/result.json>`
 
-墙体脚本输出的 DXF 和 JSON 报告必须先读取并记录，再传给 `generate_windows.py`；若墙体尚未闭合，窗户和门脚本只能以“候选识别/待修复模式”运行，输出候选报告，不得把结果标记为最终 CAD 合格。尺寸链、总宽、总高和墙体外框不能凭空填写，必须来自用户、图纸标注或经过复核的图像测量。
+墙体脚本输出的 DXF 和 JSON 报告必须先读取并记录，再传给 `generate_windows.py`；若墙体尚未闭合，窗户和门脚本以“候选识别/待修复模式”运行，输出候选报告并继续门阶段，不得把结果标记为最终 CAD 合格。原图窗线和门线不是中断条件。尺寸链、总宽、总高和墙体外框不能凭空填写，必须来自用户、图纸标注或经过复核的图像测量。
 
 `generate_by_pic.py` 无论识别到实心墙带还是细线墙体，都应尝试重建为闭合 `LWPOLYLINE`。禁止将独立 `LINE` 或未闭合 `LWPOLYLINE` 当作最终墙体；无法闭合时脚本应写出带 `stage_status: needs_repair`、问题位置和 `repair_queue` 的中间 DXF/JSON/PNG，并返回可被上层流程记录的非致命阶段状态，不得因单个墙段问题直接结束整条识别流程。
 

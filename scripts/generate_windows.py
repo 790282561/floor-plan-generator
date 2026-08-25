@@ -855,8 +855,9 @@ def generate(
     pixel_windows, mask = detect_windows(
         gray, plan_bbox, overall_width_mm, overall_height_mm, wall_widths
     )
+    stage_issues: list[str] = []
     if not pixel_windows:
-        raise RuntimeError("未找到满足‘两条窗扇内线 + 两侧墙面线 + 两端封边’规则的窗户")
+        stage_issues.append("未找到满足窗户几何规则的候选；保留原墙体并继续流程")
 
     doc = ezdxf.readfile(wall_dxf)
     doc.units = ezdxf.units.MM
@@ -919,16 +920,16 @@ def generate(
             accepted.append(normalized)
 
     if not accepted:
-        raise RuntimeError("窗户候选全部被墙体匹配规则拒绝")
+        stage_issues.append("窗户候选全部被墙体匹配规则拒绝；保留原墙体并继续流程")
 
-    wall_topology = rebuild_closed_wall_polylines(
-        msp, maximum_closure_mm=max(wall_widths) + 1.0
-    )
+    try:
+        wall_topology = rebuild_closed_wall_polylines(msp, maximum_closure_mm=max(wall_widths) + 1.0)
+    except RuntimeError as error:
+        stage_issues.append(f"墙体拓扑校核未通过：{error}")
+        wall_topology = {"wall_topology": "needs_repair", "topology_error": str(error)}
     final_wall_overlaps = sum(count_wall_overlaps(msp, item) for item in accepted)
     if final_wall_overlaps:
-        raise RuntimeError(
-            f"闭合墙体重建后，窗洞范围内仍有 {final_wall_overlaps} 条墙体边界"
-        )
+        stage_issues.append(f"闭合墙体重建后，窗洞范围内仍有 {final_wall_overlaps} 条墙体边界")
 
     output.parent.mkdir(parents=True, exist_ok=True)
     doc.saveas(output)
@@ -963,6 +964,8 @@ def generate(
         "audit_errors": len(auditor.errors),
         "audit_fixes": len(auditor.fixes),
         "target_cad_visual_check": False,
+        "stage_status": "needs_repair" if stage_issues else "ready",
+        "repair_queue": stage_issues,
     }
     output.with_suffix(".json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
