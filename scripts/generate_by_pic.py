@@ -745,7 +745,7 @@ def generate(
     for polyline in polylines:
         msp.add_lwpolyline(
             polyline,
-            close=False,
+            close=True,
             dxfattribs={"layer": "WALLS"},
         )
 
@@ -771,9 +771,22 @@ def generate(
         and entity.dxftype() == "LWPOLYLINE"
         and entity.closed
     )
-    # Closure is intentionally not an acceptance criterion. The source image
-    # is authoritative; preserve open/fragmented wall evidence as-is.
-    wall_geometry_valid = None
+    wall_geometry_valid = (
+        wall_lines == 0
+        and open_wall_polylines == 0
+        and closed_wall_polylines > 0
+        and len(auditor.errors) == 0
+    )
+    if not wall_geometry_valid:
+        stage_issues.append({
+            "stage": "walls",
+            "issue": "wall_geometry_invalid",
+            "wall_boundary_lines": wall_lines,
+            "wall_open_polylines": open_wall_polylines,
+            "wall_closed_polylines": closed_wall_polylines,
+            "audit_errors": len(auditor.errors),
+            "suggested_repair": "重建为无独立墙线且全部闭合的墙体 LWPOLYLINE",
+        })
 
     output.parent.mkdir(parents=True, exist_ok=True)
     doc.saveas(output)
