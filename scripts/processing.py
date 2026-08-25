@@ -73,6 +73,8 @@ class Door:
     wall_orientation: str
     swing_direction: str
     confidence: float
+    arc_start_deg: float = 0.0
+    arc_end_deg: float = 0.0
 
 
 @dataclass
@@ -182,6 +184,48 @@ def make_ink_mask(gray: np.ndarray) -> np.ndarray:
     # Preserve one-pixel dimension, window, and glyph strokes.  A 2x2 opening
     # would make wall extraction look clean but erase exactly those classes.
     return mask
+
+
+def filter_wall_ink_by_width(
+    ink: np.ndarray, width_reduction_px: int = 10
+) -> tuple[np.ndarray, dict[str, int | float]]:
+    """Keep only strokes with a core after reducing total width by N pixels.
+
+    An (N+1)x(N+1) erosion removes N pixels from the total stroke width
+    (approximately N/2 per side). The surviving core is dilated back and
+    intersected with the original ink, so retained walls keep their original
+    thickness while thin lines disappear.
+    """
+    if width_reduction_px < 1:
+        return ink.copy(), {
+            "width_reduction_px": 0,
+            "input_ink_pixels": int(np.count_nonzero(ink)),
+            "surviving_core_pixels": int(np.count_nonzero(ink)),
+            "retained_wall_pixels": int(np.count_nonzero(ink)),
+            "eliminated_components": 0,
+        }
+    kernel_size = width_reduction_px + 1
+    kernel = np.ones((kernel_size, kernel_size), np.uint8)
+    core = cv2.erode(ink, kernel)
+    restored = cv2.dilate(core, kernel)
+    retained = cv2.bitwise_and(restored, ink)
+
+    component_count, labels = cv2.connectedComponents(ink, 8)
+    eliminated = 0
+    for index in range(1, component_count):
+        if not np.any(retained[labels == index]):
+            eliminated += 1
+    return retained, {
+        "width_reduction_px": width_reduction_px,
+        "erosion_kernel_px": kernel_size,
+        "input_ink_pixels": int(np.count_nonzero(ink)),
+        "surviving_core_pixels": int(np.count_nonzero(core)),
+        "retained_wall_pixels": int(np.count_nonzero(retained)),
+        "eliminated_components": eliminated,
+        "retained_pixel_ratio": round(
+            np.count_nonzero(retained) / max(np.count_nonzero(ink), 1), 4
+        ),
+    }
 
 
 def detect_walls(ink: np.ndarray) -> tuple[np.ndarray, list[WallSegment], Box]:
@@ -432,6 +476,34 @@ def infer_swing_direction(start_deg: float, run_fraction: float) -> str:
     return f"{vertical}-{horizontal}"
 
 
+def tight_arc_bounding_box(
+    cx: float,
+    cy: float,
+    radius: float,
+    start_deg: float,
+    run_fraction: float,
+) -> Box:
+    """Return the exact axis-aligned bbox of the detected arc segment."""
+    start = start_deg % 360.0
+    span = max(0.0, min(360.0, run_fraction * 360.0))
+    angles = [start, (start + span) % 360.0]
+    for cardinal in (0.0, 90.0, 180.0, 270.0):
+        if (cardinal - start) % 360.0 <= span + 1e-6:
+            angles.append(cardinal)
+    points = [
+        (
+            cx + radius * math.cos(math.radians(angle)),
+            cy + radius * math.sin(math.radians(angle)),
+        )
+        for angle in angles
+    ]
+    min_x = math.floor(min(point[0] for point in points))
+    min_y = math.floor(min(point[1] for point in points))
+    max_x = math.ceil(max(point[0] for point in points))
+    max_y = math.ceil(max(point[1] for point in points))
+    return Box(min_x, min_y, max(1, max_x - min_x), max(1, max_y - min_y))
+
+
 def detect_doors(
     gray: np.ndarray,
     wall_mask: np.ndarray,
@@ -469,7 +541,11 @@ def detect_doors(
         run, start_deg, end_deg = longest_angular_run(edges, cx, cy, radius)
         if not (0.10 <= run <= 0.42):
             continue
-        box = clip_box(Box(cx - radius, cy - radius, radius * 2, radius * 2), width, height)
+        box = clip_box(
+            tight_arc_bounding_box(cx, cy, radius, start_deg, run),
+            width,
+            height,
+        )
         horizontal_score = np.count_nonzero(
             wall_mask[max(0, cy - 8) : min(height, cy + 9), max(0, cx - radius) : min(width, cx + radius)]
         )
@@ -485,6 +561,8 @@ def detect_doors(
             wall_orientation=wall_orientation,
             swing_direction=infer_swing_direction(start_deg, run),
             confidence=round(confidence, 3),
+            arc_start_deg=round(start_deg, 3),
+            arc_end_deg=round((start_deg + run * 360.0) % 360.0, 3),
         )
         candidates.append((confidence, door, start_deg, end_deg))
 
@@ -646,7 +724,10 @@ def process_floor_plan(
     gray = cv2.cvtColor(normalized, cv2.COLOR_BGR2GRAY)
     ink = make_ink_mask(gray)
 
-    wall_mask, wall_segments, plan_box = detect_walls(ink)
+    wall_candidate_ink, wall_width_filter = filter_wall_ink_by_width(
+        ink, width_reduction_px=10
+    )
+    wall_mask, wall_segments, plan_box = detect_walls(wall_candidate_ink)
     calibrated_walls = (
         calibrate_wall_geometry(plan_box, wall_segments, wall_calibration)
         if wall_calibration is not None
@@ -735,6 +816,7 @@ def process_floor_plan(
         "plan_bbox": asdict(plan_box),
         "walls": [asdict(item) for item in wall_segments],
         "wall_calibration": calibrated_walls,
+        "wall_width_filter": wall_width_filter,
         "doors": [asdict(item) for item in doors],
         "windows": [asdict(item) for item in windows],
         "room_labels": [asdict(item) for item in room_labels],
