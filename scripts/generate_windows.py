@@ -882,6 +882,28 @@ def entity_axis_line(entity) -> tuple[str, float, float, float] | None:
     return None
 
 
+def iter_wall_axis_lines(msp):
+    """Yield orthogonal wall segments from LINEs and closed wall polylines."""
+    for entity in msp:
+        if entity.dxf.layer not in WALL_LAYERS:
+            continue
+        if entity.dxftype() == "LINE":
+            item = entity_axis_line(entity)
+            if item is not None:
+                yield item
+            continue
+        if entity.dxftype() != "LWPOLYLINE":
+            continue
+        points = [(float(x), float(y)) for x, y, *_ in entity.get_points()]
+        if entity.closed and points:
+            points.append(points[0])
+        for start, end in zip(points, points[1:]):
+            if abs(start[1] - end[1]) <= 0.5:
+                yield "horizontal", (start[1] + end[1]) / 2.0, min(start[0], end[0]), max(start[0], end[0])
+            elif abs(start[0] - end[0]) <= 0.5:
+                yield "vertical", (start[0] + end[0]) / 2.0, min(start[1], end[1]), max(start[1], end[1])
+
+
 def explode_wall_polylines(msp) -> int:
     """把正交墙体多段线转成可切洞的线段，尺寸及其他图层保持不变。"""
 
@@ -917,10 +939,7 @@ def file_sha256(path: Path) -> str:
 def unique_wall_coordinates(msp, orientation: str) -> tuple[list[float], list[float]]:
     perpendicular: list[float] = []
     along: list[float] = []
-    for entity in msp:
-        item = entity_axis_line(entity)
-        if item is None:
-            continue
+    for item in iter_wall_axis_lines(msp):
         item_orientation, axis, start, end = item
         if item_orientation == orientation:
             perpendicular.append(axis)
@@ -944,6 +963,9 @@ def normalize_window_to_wall(
     wall_widths_mm: Sequence[float],
 ) -> tuple[CadWindow | None, str | None]:
     face_coords, along_coords = unique_wall_coordinates(msp, item.orientation)
+    # Use the actual parallel wall edges as the source of truth.  This removes
+    # image-mapping skew (for example 0.55, 12.22) and makes the frame width
+    # exactly equal to the wall width rather than an independently inferred one.
     face_tolerance = max(wall_widths_mm) * 0.8
     face1 = nearest(item.face1, face_coords, face_tolerance)
     face2 = nearest(item.face2, face_coords, face_tolerance)
@@ -966,7 +988,7 @@ def normalize_window_to_wall(
             start=round(start, 3),
             end=round(end, 3),
             face1=round(face1, 3),
-            face2=round(face2, 3),
+            face2=round(face1 + expected_width, 3),
             confidence=item.confidence,
             source=item.source,
             evidence_line_count=item.evidence_line_count,
