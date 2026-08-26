@@ -73,27 +73,79 @@ class CadWindow:
         return self.face2 - self.face1
 
 
+def find_corner_window_pairs(
+    windows: Sequence[CadWindow], tolerance: float
+) -> list[dict]:
+    """Pair perpendicular windows one-to-one when both terminate at one wall corner."""
+    candidates: list[tuple[float, int, int, float, float, float, float]] = []
+    for horizontal_index, horizontal in enumerate(windows):
+        if horizontal.orientation != "horizontal":
+            continue
+        horizontal_axis = (horizontal.face1 + horizontal.face2) / 2.0
+        for vertical_index, vertical in enumerate(windows):
+            if vertical.orientation != "vertical":
+                continue
+            vertical_axis = (vertical.face1 + vertical.face2) / 2.0
+            horizontal_corner = min(
+                (horizontal.start, horizontal.end), key=lambda value: abs(value - vertical_axis)
+            )
+            vertical_corner = min(
+                (vertical.start, vertical.end), key=lambda value: abs(value - horizontal_axis)
+            )
+            x_error = abs(horizontal_corner - vertical_axis)
+            y_error = abs(vertical_corner - horizontal_axis)
+            if x_error <= tolerance and y_error <= tolerance:
+                horizontal_far = (
+                    horizontal.end if horizontal_corner == horizontal.start else horizontal.start
+                )
+                vertical_far = vertical.end if vertical_corner == vertical.start else vertical.start
+                candidates.append((
+                    x_error + y_error,
+                    horizontal_index,
+                    vertical_index,
+                    horizontal_corner,
+                    vertical_corner,
+                    horizontal_far,
+                    vertical_far,
+                ))
+
+    groups: list[dict] = []
+    used: set[int] = set()
+    for error, horizontal_index, vertical_index, horizontal_corner, vertical_corner, horizontal_far, vertical_far in sorted(candidates):
+        if horizontal_index in used or vertical_index in used:
+            continue
+        used.update((horizontal_index, vertical_index))
+        horizontal = windows[horizontal_index]
+        vertical = windows[vertical_index]
+        groups.append({
+            "type": "corner_window",
+            "horizontal_index": horizontal_index,
+            "vertical_index": vertical_index,
+            "horizontal": asdict(horizontal),
+            "vertical": asdict(vertical),
+            "corner": [
+                round((vertical.face1 + vertical.face2) / 2.0, 3),
+                round((horizontal.face1 + horizontal.face2) / 2.0, 3),
+            ],
+            "horizontal_corner": round(horizontal_corner, 3),
+            "vertical_corner": round(vertical_corner, 3),
+            "horizontal_far": round(horizontal_far, 3),
+            "vertical_far": round(vertical_far, 3),
+            "connection_error_mm": round(error, 3),
+            "evidence_line_count": 4,
+            "source_evidence_line_counts": [
+                horizontal.evidence_line_count,
+                vertical.evidence_line_count,
+            ],
+            "status": "MERGED_CONTINUOUS_L_SHAPED_FRAME",
+        })
+    return groups
+
+
 def identify_corner_window_groups(
     windows: Sequence[CadWindow], tolerance: float
 ) -> list[dict]:
-    horizontal = [item for item in windows if item.orientation == "horizontal"]
-    vertical = [item for item in windows if item.orientation == "vertical"]
-    groups: list[dict] = []
-    for first in horizontal:
-        first_axis = (first.face1 + first.face2) / 2.0
-        for second in vertical:
-            second_axis = (second.face1 + second.face2) / 2.0
-            x_error = min(abs(first.start - second_axis), abs(first.end - second_axis))
-            y_error = min(abs(second.start - first_axis), abs(second.end - first_axis))
-            if x_error <= tolerance and y_error <= tolerance:
-                groups.append({
-                    "type": "corner_window",
-                    "horizontal": asdict(first),
-                    "vertical": asdict(second),
-                    "corner": [round(second_axis, 3), round(first_axis, 3)],
-                    "status": "DETECTED_L_SHAPED_FRAME",
-                })
-    return groups
+    return find_corner_window_pairs(windows, tolerance)
 
 
 def read_gray(path: Path) -> np.ndarray:
@@ -1178,6 +1230,63 @@ def add_window_geometry(msp, window: CadWindow) -> None:
     msp.add_lwpolyline(corners, close=True, dxfattribs={"layer": WINDOW_LAYER})
 
 
+def window_frame_axes(window: CadWindow) -> list[float]:
+    return [
+        window.face1,
+        window.face1 + window.wall_width / 3.0,
+        window.face1 + window.wall_width * 2.0 / 3.0,
+        window.face2,
+    ]
+
+
+def add_corner_window_geometry(msp, group: dict) -> list[list[list[float]]]:
+    """Draw four continuous L-shaped polylines following window_corner_legend.jpg."""
+    horizontal = CadWindow(**group["horizontal"])
+    vertical = CadWindow(**group["vertical"])
+    horizontal_corner = float(group["horizontal_corner"])
+    vertical_corner = float(group["vertical_corner"])
+    horizontal_far = float(group["horizontal_far"])
+    vertical_far = float(group["vertical_far"])
+    horizontal_direction = 1 if horizontal_far > horizontal_corner else -1
+    vertical_direction = 1 if vertical_far > vertical_corner else -1
+
+    horizontal_axes = window_frame_axes(horizontal)
+    vertical_axes = window_frame_axes(vertical)
+    if horizontal_direction != vertical_direction:
+        horizontal_axes = list(reversed(horizontal_axes))
+
+    paths: list[list[list[float]]] = []
+    for vertical_axis, horizontal_axis in zip(vertical_axes, horizontal_axes):
+        points = [
+            (horizontal_far, horizontal_axis),
+            (vertical_axis, horizontal_axis),
+            (vertical_axis, vertical_far),
+        ]
+        msp.add_lwpolyline(points, close=False, dxfattribs={"layer": WINDOW_LAYER})
+        paths.append([[round(x, 3), round(y, 3)] for x, y in points])
+    return paths
+
+
+def add_merged_window_geometry(
+    msp, windows: Sequence[CadWindow], tolerance: float
+) -> tuple[list[dict], int]:
+    groups = find_corner_window_pairs(windows, tolerance)
+    grouped_indices: set[int] = set()
+    for group_index, group in enumerate(groups, start=1):
+        grouped_indices.update((group["horizontal_index"], group["vertical_index"]))
+        group["id"] = f"CW{group_index:02d}"
+        group["geometry"] = add_corner_window_geometry(msp, group)
+        group["entity_type"] = "LWPOLYLINE"
+        group["continuous_l_polylines"] = 4
+    ordinary_count = 0
+    for index, window in enumerate(windows):
+        if index in grouped_indices:
+            continue
+        add_window_geometry(msp, window)
+        ordinary_count += 1
+    return groups, ordinary_count
+
+
 def count_wall_overlaps(msp, window: CadWindow, tolerance: float = 2.0) -> int:
     count = 0
     for entity in msp:
@@ -1461,7 +1570,6 @@ def generate(
             # wall geometry cannot provide a usable pair of faces. Draw the
             # window in image-mapped CAD coordinates and keep the mismatch in
             # the report instead of dropping the detected window.
-            add_window_geometry(msp, raw)
             accepted.append(raw)
             records.append(
                 {
@@ -1492,8 +1600,6 @@ def generate(
         changed, previous_overlaps = split_wall_faces(msp, normalized)
         remaining_overlaps = count_wall_overlaps(msp, normalized)
         status = "ACCEPTED" if remaining_overlaps == 0 else "REJECTED"
-        if status == "ACCEPTED":
-            add_window_geometry(msp, normalized)
         records.append(
             {
                 "id": f"W{index:02d}",
@@ -1512,6 +1618,10 @@ def generate(
 
     if not accepted:
         stage_issues.append("窗户候选全部被墙体匹配规则拒绝；保留原墙体并继续流程")
+
+    corner_window_groups, ordinary_window_count = add_merged_window_geometry(
+        msp, accepted, tolerance=max(wall_widths) * 2.0
+    )
 
     # Preserve the source wall geometry. Wall closure is neither rebuilt nor
     # used as a gate for window entity generation.
@@ -1579,9 +1689,10 @@ def generate(
         "accepted_image_only_windows": sum(
             1 for item in records if item.get("status") == "ACCEPTED_IMAGE_ONLY"
         ),
-        "corner_window_groups": identify_corner_window_groups(
-            accepted, tolerance=max(wall_widths) * 2.0
-        ),
+        "corner_window_groups": corner_window_groups,
+        "corner_window_group_count": len(corner_window_groups),
+        "ordinary_window_count": ordinary_window_count,
+        "generated_window_objects": len(corner_window_groups) + ordinary_window_count,
         "rejected_windows": len(records) - len(accepted),
         "converted_wall_polylines": converted_polylines,
         "windows": records,
@@ -1595,6 +1706,13 @@ def generate(
                 if entity.dxftype() == "LWPOLYLINE"
                 and entity.dxf.layer == WINDOW_LAYER
                 and entity.closed
+            ),
+            "open_corner_window_polylines": sum(
+                1
+                for entity in msp
+                if entity.dxftype() == "LWPOLYLINE"
+                and entity.dxf.layer == WINDOW_LAYER
+                and not entity.closed
             ),
         },
         "audit_errors": len(auditor.errors),
