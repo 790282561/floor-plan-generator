@@ -45,42 +45,32 @@ def read_gray(path: Path) -> np.ndarray:
     return image
 
 
-def apply_high_weight_wall_mask(
+def load_wall_mask_as_only_evidence(
     gray: np.ndarray,
     wall_mask_path: Path | None,
-    mask_weight: float,
+    _mask_weight: float,
 ) -> tuple[np.ndarray, dict]:
     if wall_mask_path is None:
-        return gray, {
-            "wall_mask_used": False,
-            "wall_mask_weight": 0.0,
-            "wall_mask_path": None,
-        }
-    if not 0.5 < mask_weight <= 1.0:
-        raise ValueError("wall mask weight 必须大于 0.5 且不超过 1.0")
+        raise ValueError("必须提供 processing.py 生成的 --wall-mask；原图不能作为墙体几何依据")
     mask_gray = read_gray(wall_mask_path)
     if mask_gray.shape != gray.shape:
-        mask_gray = cv2.resize(
-            mask_gray, (gray.shape[1], gray.shape[0]), interpolation=cv2.INTER_NEAREST
+        raise ValueError(
+            "墙体 mask 与原图尺寸不一致；为避免改变 mask 边界，不允许缩放后继续"
         )
-    source_ink = gray < 190
     mask_ink = mask_gray >= 127
-    weighted_score = mask_ink.astype(np.float32) * mask_weight + source_ink.astype(np.float32) * (1.0 - mask_weight)
-    fused_ink = weighted_score >= 0.5
-    intersection = int(np.count_nonzero(source_ink & mask_ink))
-    union = int(np.count_nonzero(source_ink | mask_ink))
     mask_pixels = int(np.count_nonzero(mask_ink))
-    fused = np.where(fused_ink, 0, 255).astype(np.uint8)
-    return fused, {
+    if mask_pixels == 0:
+        raise ValueError(f"墙体 mask 为空：{wall_mask_path}")
+    evidence = np.where(mask_ink, 0, 255).astype(np.uint8)
+    return evidence, {
         "wall_mask_used": True,
-        "wall_mask_weight": round(mask_weight, 3),
+        "wall_mask_weight": 1.0,
         "wall_mask_path": str(wall_mask_path.resolve()),
         "wall_mask_pixels": mask_pixels,
-        "source_mask_iou": round(intersection / max(union, 1), 4),
-        "mask_wall_retention": round(
-            np.count_nonzero(fused_ink & mask_ink) / max(mask_pixels, 1), 4
-        ),
-        "evidence_policy": "wall-mask-high-weight",
+        "mask_wall_retention": 1.0,
+        "evidence_policy": "wall-mask-only",
+        "source_image_used_for_wall_geometry": False,
+        "postprocessing_applied_after_edge_pickup": False,
     }
 
 
@@ -524,90 +514,31 @@ def extract_wall_geometry(
 ) -> tuple[
     list[tuple[int, int, int, int]], list[list[tuple[float, float]]], dict
 ]:
+    # `gray` is already the canonical binary wall mask rendered as black wall
+    # pixels on white. Pick every contour edge directly. CHAIN_APPROX_NONE is
+    # intentional: no simplification, snapping, merging, morphology, component
+    # filtering, thickness normalization, or topology repair is allowed here.
+    mask = np.uint8(gray < 127) * 255
+    contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+    raw_lines: list[tuple[int, int, int, int]] = []
+    for contour in contours:
+        points = [(int(point[0][0]), int(point[0][1])) for point in contour]
+        if len(points) < 2:
+            continue
+        for start, end in zip(points, points[1:] + points[:1]):
+            if start != end:
+                raw_lines.append((start[0], start[1], end[0], end[1]))
+
     x1, y1, x2, y2 = WALL_BBOX_PX
-    roi = np.uint8(gray[y1 : y2 + 1, x1 : x2 + 1] < 190) * 255
-    roi = keep_wall_components(roi)
-
-    # CAD exports arrive in two common forms: thin outline linework and solid
-    # black wall strips.  Erosion removes thin strokes but preserves the core
-    # of solid strips, which provides a stable automatic mode switch.
-    ink_pixels = int(np.count_nonzero(roi))
-    eroded = cv2.erode(roi, np.ones((5, 5), np.uint8))
-    solid_ratio = np.count_nonzero(eroded) / max(ink_pixels, 1)
-    if solid_ratio >= 0.12:
-        extraction_mode = "solid-wall-boundaries"
-        estimated_thickness = estimate_wall_thickness_px(roi)
-        rectangles, assignments = extract_standard_wall_rectangles(
-            roi, estimated_thickness
-        )
-        polylines = rectangles_to_closed_polylines(rectangles)
-        return [], polylines, {
-            "horizontal_boundary_lines": 0,
-            "vertical_boundary_lines": 0,
-            "closed_wall_polylines": len(polylines),
-            "closed_wall_boundary_edges": sum(len(polyline) for polyline in polylines),
-            "extraction_mode": extraction_mode,
-            "solid_wall_ratio": round(float(solid_ratio), 4),
-            "estimated_wall_thickness_px": round(estimated_thickness, 2),
-            "wall_width_candidates_mm": WALL_WIDTHS_MM,
-            "wall_width_assignments": assignments,
-            "wall_bbox_px": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
-        }
-    else:
-        extraction_mode = "thin-outline-lines"
-        line_source = roi
-
-    horizontal_mask = cv2.morphologyEx(
-        line_source, cv2.MORPH_OPEN, np.ones((1, 7), np.uint8)
-    )
-    vertical_mask = cv2.morphologyEx(
-        line_source, cv2.MORPH_OPEN, np.ones((7, 1), np.uint8)
-    )
-
-    horizontal: list[tuple[int, int, int]] = []
-    count, _, stats, _ = cv2.connectedComponentsWithStats(horizontal_mask, 8)
-    for index in range(1, count):
-        x, y, width, height, _ = (int(value) for value in stats[index])
-        if width >= 7 and height <= 6:
-            horizontal.append((y1 + y + height // 2, x1 + x, x1 + x + width - 1))
-
-    vertical: list[tuple[int, int, int]] = []
-    count, _, stats, _ = cv2.connectedComponentsWithStats(vertical_mask, 8)
-    for index in range(1, count):
-        x, y, width, height, _ = (int(value) for value in stats[index])
-        if height >= 7 and width <= 6:
-            vertical.append((x1 + x + width // 2, y1 + y, y1 + y + height - 1))
-
-    horizontal = merge_axis_segments(horizontal)
-    vertical = merge_axis_segments(vertical)
-
-    # Trace the detected wall ink when possible. A failed trace is not fatal:
-    # retain the actual detected horizontal/vertical wall segments so the
-    # output follows the source image and later stages can still run.
-    traced = extract_closed_wall_polylines(
-        roi,
-        x_offset=x1,
-        y_offset=y1,
-        max_tab_depth=max(3, int(round(min(roi.shape) * 0.006))),
-        max_tab_width=max(12, int(round(min(roi.shape) * 0.03))),
-    )
-    polylines = [
-        [to_cad(point) for point in polygon]
-        for polygon in traced
-        if len(polygon) >= 4
-    ]
-    raw_lines = [
-        (x, start, x, end) for x, start, end in vertical
-    ] + [
-        (start, y, end, y) for y, start, end in horizontal
-    ]
-    return raw_lines if not polylines else [], polylines, {
-        "horizontal_boundary_lines": len(horizontal),
-        "vertical_boundary_lines": len(vertical),
-        "closed_wall_polylines": len(polylines),
-        "closed_wall_boundary_edges": sum(len(polyline) for polyline in polylines),
-        "extraction_mode": extraction_mode,
-        "solid_wall_ratio": round(float(solid_ratio), 4),
+    return raw_lines, [], {
+        "horizontal_boundary_lines": sum(1 for ax, ay, bx, by in raw_lines if ay == by),
+        "vertical_boundary_lines": sum(1 for ax, ay, bx, by in raw_lines if ax == bx),
+        "diagonal_boundary_lines": sum(1 for ax, ay, bx, by in raw_lines if ax != bx and ay != by),
+        "mask_contours": len(contours),
+        "closed_wall_polylines": 0,
+        "closed_wall_boundary_edges": 0,
+        "extraction_mode": "raw-mask-boundary-edges",
+        "edge_pickup_policy": "CHAIN_APPROX_NONE-no-postprocessing",
         "wall_bbox_px": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
     }
 
@@ -723,7 +654,7 @@ def generate(
     wall_mask_weight: float = 0.85,
 ) -> dict:
     gray = read_gray(source)
-    wall_evidence, mask_stats = apply_high_weight_wall_mask(
+    wall_evidence, mask_stats = load_wall_mask_as_only_evidence(
         gray, wall_mask, wall_mask_weight
     )
     lines, polylines, stats = extract_wall_geometry(wall_evidence)
@@ -771,21 +702,16 @@ def generate(
         and entity.dxftype() == "LWPOLYLINE"
         and entity.closed
     )
-    wall_geometry_valid = (
-        wall_lines == 0
-        and open_wall_polylines == 0
-        and closed_wall_polylines > 0
-        and len(auditor.errors) == 0
-    )
+    wall_geometry_valid = wall_lines > 0 and len(auditor.errors) == 0
     if not wall_geometry_valid:
         stage_issues.append({
             "stage": "walls",
-            "issue": "wall_geometry_invalid",
+            "issue": "wall_mask_boundary_output_invalid",
             "wall_boundary_lines": wall_lines,
             "wall_open_polylines": open_wall_polylines,
             "wall_closed_polylines": closed_wall_polylines,
             "audit_errors": len(auditor.errors),
-            "suggested_repair": "重建为无独立墙线且全部闭合的墙体 LWPOLYLINE",
+            "suggested_repair": "检查预处理墙体 mask；墙体阶段不得自行修复边界",
         })
 
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -800,9 +726,10 @@ def generate(
         "wall_boundary_lines": wall_lines,
         "wall_open_polylines": open_wall_polylines,
         "wall_closed_polylines": closed_wall_polylines,
-        "wall_boundary_edges": sum(len(polyline) for polyline in polylines),
-        "wall_topology": "source-image-preserved",
+        "wall_boundary_edges": wall_lines,
+        "wall_topology": "raw-mask-boundaries-unmodified",
         "wall_geometry_valid": wall_geometry_valid,
+        "ready_for_openings": True,
         "audit_errors": len(auditor.errors),
         "audit_fixes": len(auditor.fixes),
         "stage_status": "needs_repair" if stage_issues else "ready",
@@ -834,13 +761,14 @@ def main() -> int:
     parser.add_argument(
         "--wall-mask",
         type=Path,
-        help="processing.py 生成的 masks/walls.png；作为墙体轮廓高权重证据",
+        required=True,
+        help="processing.py 生成的 masks/walls.png；墙体几何的唯一依据",
     )
     parser.add_argument(
         "--wall-mask-weight",
         type=float,
         default=0.85,
-        help="墙体 mask 权重，必须大于 0.5；默认 0.85",
+        help="兼容旧命令保留；墙体 mask 始终按唯一依据（权重 1.0）处理",
     )
     parser.add_argument(
         "--wall-bbox",

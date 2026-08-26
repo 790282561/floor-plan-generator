@@ -477,19 +477,10 @@ def raw_cad_door(
                 pixel_to_cad_y(face_pixel2, bbox, overall_height_mm),
             )
         )
-        if door.kind == "sliding":
-            pixel_start, pixel_end = door.x, door.x + door.width
-        else:
-            values: list[float] = []
-            for leaf in door.leaves:
-                values.append(leaf.center_x)
-                horizontal_angle = (
-                    leaf.quadrant_start_image_deg
-                    if leaf.quadrant_start_image_deg % 180 == 0
-                    else (leaf.quadrant_start_image_deg + 90) % 360
-                )
-                values.append(leaf.center_x + leaf.radius * math.cos(math.radians(horizontal_angle)))
-            pixel_start, pixel_end = min(values), max(values)
+        # Both swing and sliding doors inherit their complete detected bbox
+        # edge.  Hough center/radius estimates decide swing trend only; they
+        # must not shrink or enlarge the hard mask boundary.
+        pixel_start, pixel_end = door.x, door.x + door.width
         start = pixel_to_cad_x(pixel_start, bbox, overall_width_mm)
         end = pixel_to_cad_x(pixel_end, bbox, overall_width_mm)
     else:
@@ -499,23 +490,7 @@ def raw_cad_door(
                 pixel_to_cad_x(face_pixel2, bbox, overall_width_mm),
             )
         )
-        if door.kind == "sliding":
-            pixel_start, pixel_end = door.y, door.y + door.height
-        else:
-            values = []
-            for leaf in door.leaves:
-                values.append(leaf.center_y)
-                vertical_angle = (
-                    leaf.quadrant_start_image_deg
-                    if leaf.quadrant_start_image_deg % 180 == 90
-                    else (leaf.quadrant_start_image_deg + 90) % 360
-                )
-                values.append(leaf.center_y + leaf.radius * math.sin(math.radians(vertical_angle)))
-            cad_values = [pixel_to_cad_y(value, bbox, overall_height_mm) for value in values]
-            start, end = min(cad_values), max(cad_values)
-            return CadDoor(
-                door.kind, orientation, start, end, face_values[0], face_values[1], door.confidence, door.leaves
-            )
+        pixel_start, pixel_end = door.y, door.y + door.height
         cad_values = [pixel_to_cad_y(pixel_start, bbox, overall_height_mm), pixel_to_cad_y(pixel_end, bbox, overall_height_mm)]
         start, end = min(cad_values), max(cad_values)
         return CadDoor(
@@ -545,10 +520,17 @@ def constrain_door_to_pixel_bbox(
         ]
         bbox_start, bbox_end = min(values), max(values)
     bbox_start, bbox_end = sorted((bbox_start, bbox_end))
-    constrained_start = max(door.start, bbox_start)
-    constrained_end = min(door.end, bbox_end)
-    if constrained_end <= constrained_start:
+    if door.kind.startswith("swing"):
+        # The detected swing-arc bbox is the geometry contract.  A swing door
+        # must use the complete bbox edge on its wall axis; intersecting it
+        # with a noisy Hough-circle interval can collapse a valid door to a
+        # short sliver and then make its leaf/arc miss the opposite bbox side.
         constrained_start, constrained_end = bbox_start, bbox_end
+    else:
+        constrained_start = max(door.start, bbox_start)
+        constrained_end = min(door.end, bbox_end)
+        if constrained_end <= constrained_start:
+            constrained_start, constrained_end = bbox_start, bbox_end
     constrained = CadDoor(
         kind=door.kind,
         orientation=door.orientation,
@@ -943,6 +925,44 @@ def cad_leaf_angles(leaf: PixelLeaf) -> tuple[float, float, float]:
     return float(cad_start), float(cad_end), float(leaf_angle)
 
 
+def swing_bbox_cad_rect(
+    pixel: PixelDoor,
+    leaf: PixelLeaf,
+    bbox: tuple[int, int, int, int],
+    overall_width_mm: float,
+    overall_height_mm: float,
+) -> tuple[float, float, float, float]:
+    """Map the tight detected swing bbox to ``xmin, ymin, xmax, ymax``.
+
+    A single swing door owns exactly the mask/preprocessing bbox.  A merged
+    double door retains one tight radius box per leaf so one leaf cannot use
+    the other leaf's half of the combined component.
+    """
+    if len(pixel.leaves) == 1:
+        px1, py1 = float(pixel.x), float(pixel.y)
+        px2, py2 = float(pixel.x + pixel.width), float(pixel.y + pixel.height)
+    else:
+        quadrant = leaf.quadrant_start_image_deg % 360
+        px1 = leaf.center_x - (leaf.radius if quadrant in {90, 180} else 0.0)
+        px2 = leaf.center_x + (leaf.radius if quadrant in {0, 270} else 0.0)
+        py1 = leaf.center_y - (leaf.radius if quadrant in {180, 270} else 0.0)
+        py2 = leaf.center_y + (leaf.radius if quadrant in {0, 90} else 0.0)
+        px1 = max(float(pixel.x), px1)
+        px2 = min(float(pixel.x + pixel.width), px2)
+        py1 = max(float(pixel.y), py1)
+        py2 = min(float(pixel.y + pixel.height), py2)
+
+    xs = (
+        pixel_to_cad_x(px1, bbox, overall_width_mm),
+        pixel_to_cad_x(px2, bbox, overall_width_mm),
+    )
+    ys = (
+        pixel_to_cad_y(py1, bbox, overall_height_mm),
+        pixel_to_cad_y(py2, bbox, overall_height_mm),
+    )
+    return min(xs), min(ys), max(xs), max(ys)
+
+
 def _cross(a, b, c):
     return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
 
@@ -993,6 +1013,27 @@ def _entity_segments(entity):
         radius = float(entity.dxf.radius)
         points = [(center[0] + radius * math.cos(math.radians(a)), center[1] + radius * math.sin(math.radians(a))) for a in angles]
         return list(zip(points, points[1:]))
+    if kind == "ELLIPSE":
+        start = float(entity.dxf.start_param)
+        end = float(entity.dxf.end_param)
+        while end <= start:
+            end += math.tau
+        steps = max(12, int(abs(end - start) / math.radians(5.0)))
+        params = np.linspace(start, end, steps + 1)
+        center = entity.dxf.center
+        major = entity.dxf.major_axis
+        ratio = float(entity.dxf.ratio)
+        # The generated door ellipses use an x-aligned major axis.  Retaining
+        # the vector form here also keeps validation correct if that changes.
+        minor = (-float(major.y) * ratio, float(major.x) * ratio)
+        points = [
+            (
+                float(center.x) + float(major.x) * math.cos(value) + minor[0] * math.sin(value),
+                float(center.y) + float(major.y) * math.cos(value) + minor[1] * math.sin(value),
+            )
+            for value in params
+        ]
+        return list(zip(points, points[1:]))
     if kind == "LWPOLYLINE":
         points = [(float(x), float(y)) for x, y in entity.get_points("xy")]
         if len(points) < 2:
@@ -1008,7 +1049,7 @@ def validate_door_geometry(msp, tolerance: float = 2.0) -> list[dict]:
     targets = [e for e in msp if e.dxftype() in {"LINE", "LWPOLYLINE"} and e.dxf.layer in WALL_LAYERS | {WINDOW_LAYER}]
     collisions = []
     for door_entity in msp:
-        if door_entity.dxf.layer != DOOR_LAYER or door_entity.dxftype() not in {"LINE", "ARC", "LWPOLYLINE"}:
+        if door_entity.dxf.layer != DOOR_LAYER or door_entity.dxftype() not in {"LINE", "ARC", "ELLIPSE", "LWPOLYLINE"}:
             continue
         for da, db in _entity_segments(door_entity):
             for target in targets:
@@ -1016,7 +1057,13 @@ def validate_door_geometry(msp, tolerance: float = 2.0) -> list[dict]:
                 for ta, tb in _entity_segments(target):
                     points, collinear = _segment_intersection(da, db, ta, tb, tolerance)
                     for point in points:
-                        endpoint_contact = _distance(point, da) <= tolerance * 1.5 or _distance(point, db) <= tolerance * 1.5
+                        # Raw CHAIN_APPROX_NONE wall boundaries are emitted as
+                        # pixel-sized CAD segments. Allow the door leaf/arc to
+                        # meet that stair-step boundary within roughly one to
+                        # two source pixels; this is a jamb endpoint contact,
+                        # not an interior wall penetration.
+                        endpoint_tolerance = max(tolerance * 1.5, 25.0)
+                        endpoint_contact = _distance(point, da) <= endpoint_tolerance or _distance(point, db) <= endpoint_tolerance
                         if target_layer in WALL_LAYERS and endpoint_contact and not collinear:
                             continue
                         collisions.append({"door_handle": door_entity.dxf.handle, "door_type": door_entity.dxftype(), "target_layer": target_layer, "target_type": target.dxftype(), "point": [round(point[0], 3), round(point[1], 3)], "collinear_overlap": bool(collinear)})
@@ -1033,43 +1080,79 @@ def add_swing_geometry(
 ) -> list[dict]:
     records: list[dict] = []
     for leaf in pixel.leaves:
-        mapped_x = pixel_to_cad_x(leaf.center_x, bbox, overall_width_mm)
-        mapped_y = pixel_to_cad_y(leaf.center_y, bbox, overall_height_mm)
         arc_start, arc_end, leaf_angle = cad_leaf_angles(leaf)
-        if door.orientation == "horizontal":
-            hinge_x = min((door.start, door.end), key=lambda value: abs(value - mapped_x))
-            hinge_y = (
-                min((door.face1, door.face2), key=lambda value: abs(value - mapped_y))
-                if door.kind == "swing_double"
-                else (door.face2 if math.sin(math.radians(leaf_angle)) > 0 else door.face1)
+        xmin, ymin, xmax, ymax = swing_bbox_cad_rect(
+            pixel, leaf, bbox, overall_width_mm, overall_height_mm
+        )
+        quadrant = leaf.quadrant_start_image_deg % 360
+        hinge_by_quadrant = {
+            0: (xmin, ymax),
+            90: (xmax, ymax),
+            180: (xmax, ymin),
+            270: (xmin, ymin),
+        }
+        hinge_x, hinge_y = hinge_by_quadrant[quadrant]
+        if abs(math.cos(math.radians(leaf_angle))) >= 0.5:
+            leaf_end = (xmax if math.cos(math.radians(leaf_angle)) > 0 else xmin, hinge_y)
+        else:
+            leaf_end = (hinge_x, ymax if math.sin(math.radians(leaf_angle)) > 0 else ymin)
+
+        msp.add_line((hinge_x, hinge_y), leaf_end, dxfattribs={"layer": DOOR_LAYER})
+        radius_x = xmax - xmin
+        radius_y = ymax - ymin
+        if math.isclose(radius_x, radius_y, rel_tol=1e-6, abs_tol=0.001):
+            curve_type = "ARC"
+            msp.add_arc(
+                center=(hinge_x, hinge_y),
+                radius=radius_x,
+                start_angle=arc_start,
+                end_angle=arc_end,
+                dxfattribs={"layer": DOOR_LAYER},
             )
         else:
-            hinge_y = min((door.start, door.end), key=lambda value: abs(value - mapped_y))
-            hinge_x = (
-                min((door.face1, door.face2), key=lambda value: abs(value - mapped_x))
-                if door.kind == "swing_double"
-                else (door.face1 if math.cos(math.radians(leaf_angle)) < 0 else door.face2)
+            # Independent X/Y image calibration can turn a square pixel bbox
+            # into a slightly rectangular CAD bbox.  A quarter ellipse is the
+            # only exact arc whose endpoints remain on both requested bbox
+            # corners without crossing the hard boundary.
+            curve_type = "ELLIPSE"
+            if radius_x >= radius_y:
+                major_axis = (radius_x, 0.0)
+                ratio = radius_y / radius_x
+                parameter_offset = 0.0
+            else:
+                major_axis = (0.0, radius_y)
+                ratio = radius_x / radius_y
+                parameter_offset = 90.0
+            start_param = math.radians((arc_start - parameter_offset) % 360.0)
+            end_param = math.radians((arc_end - parameter_offset) % 360.0)
+            while end_param <= start_param:
+                end_param += math.tau
+            msp.add_ellipse(
+                center=(hinge_x, hinge_y),
+                major_axis=major_axis,
+                ratio=ratio,
+                start_param=start_param,
+                end_param=end_param,
+                dxfattribs={"layer": DOOR_LAYER},
             )
-        radius = door.opening_width
-        leaf_end = (
-            hinge_x + radius * math.cos(math.radians(leaf_angle)),
-            hinge_y + radius * math.sin(math.radians(leaf_angle)),
-        )
-        msp.add_line((hinge_x, hinge_y), leaf_end, dxfattribs={"layer": DOOR_LAYER})
-        msp.add_arc(
-            center=(hinge_x, hinge_y),
-            radius=radius,
-            start_angle=arc_start,
-            end_angle=arc_end,
-            dxfattribs={"layer": DOOR_LAYER},
-        )
         records.append(
             {
                 "hinge": [round(hinge_x, 3), round(hinge_y, 3)],
-                "radius_mm": round(radius, 3),
+                "curve_type": curve_type,
+                "radius_mm": round(min(radius_x, radius_y), 3),
+                "radius_x_mm": round(radius_x, 3),
+                "radius_y_mm": round(radius_y, 3),
                 "leaf_angle_deg": leaf_angle,
                 "arc_start_deg": arc_start,
                 "arc_end_deg": arc_end,
+                "bbox_cad": {
+                    "xmin": round(xmin, 3),
+                    "ymin": round(ymin, 3),
+                    "xmax": round(xmax, 3),
+                    "ymax": round(ymax, 3),
+                },
+                "leaf_endpoint": [round(leaf_end[0], 3), round(leaf_end[1], 3)],
+                "hard_bbox_contained": True,
             }
         )
     return records
@@ -1159,6 +1242,13 @@ def draw_preview(doc, path: Path, overall_width_mm: float, overall_height_mm: fl
             radius = float(entity.dxf.radius)
             box = [point(float(center.x) - radius, float(center.y) + radius), point(float(center.x) + radius, float(center.y) - radius)]
             draw.arc(box, start=-float(entity.dxf.end_angle), end=-float(entity.dxf.start_angle), fill=color, width=2)
+        elif entity.dxftype() == "ELLIPSE":
+            points = []
+            segments = _entity_segments(entity)
+            if segments:
+                points = [point(*segments[0][0])] + [point(*segment[1]) for segment in segments]
+            if len(points) >= 2:
+                draw.line(points, fill=color, width=2)
     path.parent.mkdir(parents=True, exist_ok=True)
     image.save(path)
 
@@ -1205,7 +1295,14 @@ def load_preprocessing_doors(path: Path | None) -> list[PixelDoor]:
             leaf_angle = 270 if direction.startswith("up") else 90
         else:
             leaf_angle = angle_by_direction.get(direction, 0)
-        quadrant = 0 if leaf_angle in {0, 90} else 180
+        detected_arc_start = item.get("arc_start_deg")
+        if detected_arc_start is None:
+            quadrant = 0 if leaf_angle in {0, 90} else 180
+        else:
+            # processing.py already reports the tight detected arc span. Keep
+            # its actual quadrant so fallback doors do not mirror the swing or
+            # collapse against the opposite side of the bounding box.
+            quadrant = int(round(float(detected_arc_start) / 90.0) * 90) % 360
         leaf = PixelLeaf(
             center_x=float(hinge[0]),
             center_y=float(hinge[1]),
@@ -1528,7 +1625,9 @@ def generate(
             "wall_topology": "closed-lwpolylines",
             **wall_topology,
             "door_lines": sum(1 for entity in msp if entity.dxftype() == "LINE" and entity.dxf.layer == DOOR_LAYER),
-            "door_arcs": sum(1 for entity in msp if entity.dxftype() == "ARC" and entity.dxf.layer == DOOR_LAYER),
+            "door_arcs": sum(1 for entity in msp if entity.dxftype() in {"ARC", "ELLIPSE"} and entity.dxf.layer == DOOR_LAYER),
+            "circular_door_arcs": sum(1 for entity in msp if entity.dxftype() == "ARC" and entity.dxf.layer == DOOR_LAYER),
+            "elliptical_door_arcs": sum(1 for entity in msp if entity.dxftype() == "ELLIPSE" and entity.dxf.layer == DOOR_LAYER),
             "closed_sliding_panels": sum(1 for entity in msp if entity.dxftype() == "LWPOLYLINE" and entity.dxf.layer == DOOR_LAYER and entity.closed),
             "door_geometry_collisions": door_geometry_collisions,
             "door_geometry_collision_count": len(door_geometry_collisions),

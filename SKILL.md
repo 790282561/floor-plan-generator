@@ -10,7 +10,7 @@ description: 根据户型图片分阶段识别并生成具有真实墙厚的墙�
 根据户型图片、草图或 CAD 截图，识别建筑外轮廓、墙体、房间、门、窗和尺寸，建立统一毫米坐标模型，生成可编辑的建筑平面图。
 所有墙体必须使用具有实际厚度的双线表达；门窗必须形成真实墙体洞口，不得只将符号叠加在连续墙线上。
 ### 1.2 适用范围
-适用于户型图重绘、草图规范化、墙体拓扑重建、窗洞窗框生成、门洞门扇及开启弧生成、房间名称标注、尺寸标注和 CAD 输出。
+适用于户型图重绘、草图规范化、墙体 mask 边界提取、窗洞窗框生成、门洞门扇及开启弧生成、房间名称标注、尺寸标注和 CAD 输出。
 
 ### 1.3 脚本调用总原则
 图形生成必须严格调用当前项目 `scripts` 目录中的实际程序，不得自行替换为不存在的脚本或绕过脚本直接猜画。图片任务必须依次调用 `processing.py`、`generate_by_pic.py`、`generate_windows.py` 和 `generate_doors.py`。
@@ -36,9 +36,9 @@ description: 根据户型图片分阶段识别并生成具有真实墙厚的墙�
 ### 2.2 建筑外轮廓识别
 识别整体边界、凹凸关系、转角、阳台、露台、门廊和附属空间，建立建筑外轮廓。
 ### 2.3 墙体识别
-识别墙体两侧边界、中心位置、长度、方向、厚度、端点和连接关系。预处理时必须先对整体黑色前景执行总宽度缩减 10px 的腐蚀筛选：使用 11×11 核，使线条两侧各减少约 5px；腐蚀后完全消失的细线不得进入墙体 mask，仍有核心的粗黑墙体再膨胀回填并与原图相交，保留原始墙厚。该步骤用于剔除门扇、门槛、尺寸线、文字和家具细线。`masks/walls.png` 是后续墙体轮廓的高权重主证据，默认权重为 0.85，原图灰度线权重为 0.15。报告必须记录宽度缩减值、腐蚀核、筛选前像素、核心像素、保留墙体像素、淘汰组件数、mask 路径、权重、原图-mask IoU 和 mask 墙体保留率。不得将墙体简化为单根中心线。
-### 2.4 墙体拓扑重建
-当前图片生成的墙体 DXF 是本任务唯一墙体基线。重建水平墙、垂直墙、L 型、T 型、十字型和转角连接时，只能在当前图片证据范围内局部处理；禁止切换到历史人工重建墙、其他参考图墙体或预置洞口模型。每个后续阶段必须记录输入墙体路径和 SHA-256。
+识别墙体两侧边界、中心位置、长度、方向、厚度、端点和连接关系。预处理时必须先对整体黑色前景执行总宽度缩减 10px 的腐蚀筛选：使用 11×11 核，使线条两侧各减少约 5px；腐蚀后完全消失的细线不得进入墙体 mask，仍有核心的粗黑墙体再膨胀回填并与原图相交，保留原始墙厚。该步骤用于剔除门扇、门槛、尺寸线、文字和家具细线。预处理完成后，`masks/walls.png` 是墙体几何的唯一参考标准，权重固定为 1.0；原图、多模态候选、历史墙体和尺寸规则均不得参与墙体边界几何。`generate_by_pic.py` 必须使用 `CHAIN_APPROX_NONE` 逐像素拾取 mask 边线，拾边后禁止再做形态学开闭、连通域过滤、轮廓简化、坐标吸附、线段合并、墙厚归一化、矩形化、闭合修补或拓扑重建，并立即把原样边界 DXF 交给窗、门阶段。不得将墙体简化为单根中心线。
+### 2.4 墙体基线冻结
+拾取 `masks/walls.png` 边线后生成的墙体 DXF 是本任务唯一且冻结的墙体基线。墙体阶段不得重建水平墙、垂直墙、L 型、T 型、十字型或转角连接；只能立即把该 DXF 传入窗、门阶段。门窗阶段仅允许在各自 bounding box 及必要墙厚缓冲范围内切真实洞口，禁止切换到历史人工重建墙、其他参考图墙体或预置洞口模型。每个后续阶段必须记录输入墙体路径和 SHA-256。
 ### 2.5 墙体断口识别
 识别门洞、窗洞及其他开口，确定所属墙段、方向、位置、宽度和开口边界。开口必须进入墙体几何模型。
 ### 2.6 门洞识别
@@ -139,13 +139,13 @@ description: 根据户型图片分阶段识别并生成具有真实墙厚的墙�
 
 1. 预处理：`python scripts/processing.py <source.png> --output-dir <preprocessed>`
 2. 多模态/OpenCV 融合：`python scripts/multimodal_fusion.py <source.png> --preprocessed-dir <preprocessed> --output <preprocessed/multimodal.json>`；读取 `multimodal.json`，按 `wall`、`window`、`door` 分流并处理冲突。
-3. 墙体生成：`python scripts/generate_by_pic.py <source.png> <walls.dxf> --data scripts/data.json --wall-mask <preprocessed/masks/walls.png> --wall-mask-weight 0.85 --overall-width-mm <总宽> --overall-height-mm <总高> --wall-bbox <x1> <y1> <x2> <y2> --horizontal-chain-mm <横向尺寸链> --vertical-chain-top-down-mm <纵向尺寸链>`
+3. 墙体生成：`python scripts/generate_by_pic.py <source.png> <walls.dxf> --data scripts/data.json --wall-mask <preprocessed/masks/walls.png> --overall-width-mm <总宽> --overall-height-mm <总高> --wall-bbox <x1> <y1> <x2> <y2> --horizontal-chain-mm <横向尺寸链> --vertical-chain-top-down-mm <纵向尺寸链>`；mask 固定按 1.0 权重作为唯一墙体几何依据。
 4. 窗户生成：`python scripts/generate_windows.py <含窗图片> <walls.dxf> <walls_windows.dxf> --data scripts/data.json --overall-width-mm <总宽> --overall-height-mm <总高> --image-wall-bbox <x1> <y1> <x2> <y2> --preprocessing-result <preprocessed/result.json>`
 5. 门及房间名称生成：`python scripts/generate_doors.py <含门图片> <上一阶段图片> <walls_windows.dxf> <final.dxf> --data scripts/data.json --overall-width-mm <总宽> --overall-height-mm <总高> --image-wall-bbox <x1> <y1> <x2> <y2> --preprocessing-result <preprocessed/result.json> --inferred-room-labels <inferred_room_labels.json>`
 
 墙体脚本输出的 DXF 和 JSON 报告必须先读取并记录，再原样传给 `generate_windows.py`；后续报告必须记录该基线的绝对路径和 SHA-256。若墙体尚未闭合，窗户和门脚本仍继续生成图元，但不得替换为历史闭合墙模型，也不得全量将墙体 `LWPOLYLINE` 转换为 `LINE`。原图窗线和门线不是中断条件。尺寸链、总宽、总高和墙体外框不能凭空填写，必须来自用户、图纸标注或经过复核的图像测量。
 
-`generate_by_pic.py` 无论识别到实心墙带还是细线墙体，都应尝试重建为闭合 `LWPOLYLINE`。禁止将独立 `LINE` 或未闭合 `LWPOLYLINE` 当作最终墙体；无法闭合时脚本应写出带 `stage_status: needs_repair`、问题位置和 `repair_queue` 的中间 DXF/JSON/PNG，并返回可被上层流程记录的非致命阶段状态，不得因单个墙段问题直接结束整条识别流程。
+`generate_by_pic.py` 只允许把 `masks/walls.png` 中逐像素拾取的原始边界写入墙体 DXF。独立 `LINE` 是原始 mask 边界的合法表达；不得为了闭合验收把边界转换或重建为 `LWPOLYLINE`，不得以墙体闭合或拓扑状态阻断后续窗、门阶段。
 
 ### 7.2 非致命阶段与修复队列
 各阶段采用“继续识别、延后阻断”策略：
@@ -177,7 +177,8 @@ description: 根据户型图片分阶段识别并生成具有真实墙厚的墙�
 - 使用单线代替墙体
 - 忽略或随意改变墙体厚度、房间数量和建筑外轮廓
 - 未执行图片预处理就直接生成
-- 墙体生成时不传入 `masks/walls.png`，或将 mask 权重设置为不高于原图权重
+- 墙体生成时不传入 `masks/walls.png`，或使用原图及任何其他证据混合、覆盖 mask 墙体边界
+- 在拾取 mask 墙边线后继续做过滤、简化、吸附、合并、矩形化、墙厚归一化、闭合修补或拓扑重建
 - 预处理墙体时跳过总宽度缩减 10px 的粗线筛选，或直接把腐蚀后的缩小墙厚作为最终墙体
 - 因低置信度、`needs_repair` 或墙体匹配失败而跳过已有图片候选的门窗图元
 - 将门窗放置在墙体之外
