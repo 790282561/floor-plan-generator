@@ -7,7 +7,7 @@ optional: geometry extraction works with only OpenCV and NumPy, while an
 installed Tesseract executable adds room-name and dimension transcription.
 
 Example:
-    python processing.py input.png --output-dir output/preprocessed
+    python processing.py input.png --output-dir D:\\中建科技\\009_自动化软件平台\\outputs\\<case_id>\\preprocessed
 """
 
 from __future__ import annotations

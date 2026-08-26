@@ -15,6 +15,11 @@ description: 根据户型图片按墙体、门、窗顺序分阶段识别并生�
 ### 1.3 脚本调用总原则
 图形生成必须严格调用当前项目 `scripts` 目录中的实际程序，不得自行替换为不存在的脚本或绕过脚本直接猜画。图片任务必须依次调用 `processing.py`、`generate_by_pic.py`、`generate_doors.py` 和 `generate_windows.py`，CAD 生成链固定为“墙体 → 门 → 窗”。
 
+### 1.4 测试与产物目录约定
+所有测试、识别中间文件、预览图、DXF、JSON 报告和校验结果统一写入：
+`D:\中建科技\009_自动化软件平台\outputs\<case_id>\`。
+`<case_id>` 应使用输入图片名或明确的验证场景名，例如 `ref_pic_7`、`_straight_wall_validation`。项目目录中的 `scripts`、Skill 文档和源代码只保存程序，不再创建或使用 `floor-plan-generator\outputs` 作为运行产物目录。命令中的 `<preprocessed>`、`<walls.dxf>` 等路径必须解析到上述外部输出根目录下对应的案例目录。
+
 ## 2. 强制执行流程
 ### 2.1 输入解析与图片预处理
 图片输入必须先运行：
@@ -139,9 +144,9 @@ description: 根据户型图片按墙体、门、窗顺序分阶段识别并生�
 
 ### 图片输入流程
 
-1. 预处理：`python scripts/processing.py <source.png> --output-dir <preprocessed>`
-2. 多模态/OpenCV 融合：`python scripts/multimodal_fusion.py <source.png> --preprocessed-dir <preprocessed> --output <preprocessed/multimodal.json>`；先读取并检查 `building_outline` 及其 mask/overlay，再按 `wall`、`door`、`window` 分流并处理冲突。
-3. 墙体生成：`python scripts/generate_by_pic.py <source.png> <walls.dxf> --data scripts/data.json --wall-mask <preprocessed/masks/walls.png> --overall-width-mm <总宽> --overall-height-mm <总高> --wall-bbox <x1> <y1> <x2> <y2> --horizontal-chain-mm <横向尺寸链> --vertical-chain-top-down-mm <纵向尺寸链>`；mask 固定按 1.0 权重作为唯一墙体几何依据。
+1. 预处理：`python scripts/processing.py <source.png> --output-dir D:\中建科技\009_自动化软件平台\outputs\<case_id>\preprocessed`
+2. 多模态/OpenCV 融合：`python scripts/multimodal_fusion.py <source.png> --preprocessed-dir D:\中建科技\009_自动化软件平台\outputs\<case_id>\preprocessed --output D:\中建科技\009_自动化软件平台\outputs\<case_id>\preprocessed\multimodal.json`；先读取并检查 `building_outline` 及其 mask/overlay，再按 `wall`、`door`、`window` 分流并处理冲突。
+3. 墙体生成：`python scripts/generate_by_pic.py <source.png> D:\中建科技\009_自动化软件平台\outputs\<case_id>\walls.dxf --data scripts/data.json --wall-mask D:\中建科技\009_自动化软件平台\outputs\<case_id>\preprocessed\masks\walls.png --overall-width-mm <总宽> --overall-height-mm <总高> --wall-bbox <x1> <y1> <x2> <y2> --horizontal-chain-mm <横向尺寸链> --vertical-chain-top-down-mm <纵向尺寸链>`；mask 固定按 1.0 权重作为唯一墙体几何依据。
 4. 门及房间名称生成：`python scripts/generate_doors.py <含门图片> <墙体阶段图片> <walls.dxf> <walls_doors.dxf> --data scripts/data.json --overall-width-mm <总宽> --overall-height-mm <总高> --image-wall-bbox <x1> <y1> <x2> <y2> --preprocessing-result <preprocessed/result.json> --inferred-room-labels <inferred_room_labels.json>`
 5. 窗户及最终图生成：`python scripts/generate_windows.py <含窗图片> <walls_doors.dxf> <final.dxf> --data scripts/data.json --overall-width-mm <总宽> --overall-height-mm <总高> --image-wall-bbox <x1> <y1> <x2> <y2> --preprocessing-result <preprocessed/result.json>`
 
