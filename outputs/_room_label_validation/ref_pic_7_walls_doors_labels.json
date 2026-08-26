@@ -1,0 +1,643 @@
+{
+  "source": "D:\\中建科技\\009_自动化软件平台\\floor-plan-generator\\references\\ref_pic_7.jpg",
+  "previous_stage_image": "D:\\中建科技\\009_自动化软件平台\\floor-plan-generator\\references\\ref_pic_7.jpg",
+  "wall_window_dxf": "D:\\中建科技\\009_自动化软件平台\\floor-plan-generator\\outputs\\ref_pic_7_20260825\\ref_pic_7_walls.dxf",
+  "wall_baseline_sha256": "82c2ce690edd3b7025b7d65ffce69e0529c3959ffa417d8968c3d3eb13de2f12",
+  "wall_baseline_policy": "fixed-source-image-geometry",
+  "output": "D:\\中建科技\\009_自动化软件平台\\floor-plan-generator\\outputs\\_room_label_validation\\ref_pic_7_walls_doors_labels.dxf",
+  "overall_width_mm": 8440.0,
+  "overall_height_mm": 7790.0,
+  "image_wall_bbox": {
+    "x1": 183,
+    "y1": 157,
+    "x2": 1100,
+    "y2": 1013
+  },
+  "wall_width_candidates_mm": [
+    240.0,
+    180.0,
+    120.0
+  ],
+  "detector": "stage-difference-quarter-arc-and-multiline-sliding-door",
+  "preprocessing_evidence": {
+    "path": "D:\\中建科技\\009_自动化软件平台\\floor-plan-generator\\outputs\\ref_pic_7_20260825\\preprocessed\\result.json",
+    "walls": 17,
+    "doors": 5,
+    "windows": 3,
+    "warnings": [
+      "未找到 Tesseract 可执行文件；已检测文字候选区域，但 room_labels/dimensions 的 text 为 null。"
+    ]
+  },
+  "pixel_candidates": 5,
+  "preprocessing_candidate_fallback": true,
+  "accepted_doors": 5,
+  "accepted_image_only_doors": 4,
+  "room_labels": [
+    {
+      "id": "R01",
+      "name": "阳台",
+      "position_px": [
+        971.5,
+        295.0
+      ],
+      "position_cad": [
+        7257.296,
+        6534.136
+      ],
+      "text_height": 243.438,
+      "source": "INFERRED_VISUAL",
+      "confidence": 0.35
+    },
+    {
+      "id": "R02",
+      "name": "飘窗",
+      "position_px": [
+        463.0,
+        311.0
+      ],
+      "position_cad": [
+        2577.099,
+        6388.528
+      ],
+      "text_height": 243.438,
+      "source": "INFERRED_VISUAL",
+      "confidence": 0.35
+    },
+    {
+      "id": "R03",
+      "name": "主卧",
+      "position_px": [
+        473.0,
+        461.0
+      ],
+      "position_cad": [
+        2669.138,
+        5023.458
+      ],
+      "text_height": 243.438,
+      "source": "INFERRED_VISUAL",
+      "confidence": 0.35
+    },
+    {
+      "id": "R04",
+      "name": "客厅",
+      "position_px": [
+        877.0,
+        575.5
+      ],
+      "position_cad": [
+        6387.525,
+        3981.454
+      ],
+      "text_height": 243.438,
+      "source": "INFERRED_VISUAL",
+      "confidence": 0.35
+    },
+    {
+      "id": "R05",
+      "name": "厨房",
+      "position_px": [
+        468.0,
+        883.0
+      ],
+      "position_cad": [
+        2623.119,
+        1183.061
+      ],
+      "text_height": 243.438,
+      "source": "INFERRED_VISUAL",
+      "confidence": 0.35
+    },
+    {
+      "id": "R06",
+      "name": "门厅",
+      "position_px": [
+        1003.0,
+        883.5
+      ],
+      "position_cad": [
+        7547.219,
+        1178.511
+      ],
+      "text_height": 243.438,
+      "source": "INFERRED_VISUAL",
+      "confidence": 0.35
+    },
+    {
+      "id": "R07",
+      "name": "卫生间",
+      "position_px": [
+        695.0,
+        940.5
+      ],
+      "position_cad": [
+        4712.41,
+        659.784
+      ],
+      "text_height": 243.438,
+      "source": "INFERRED_VISUAL",
+      "confidence": 0.35
+    }
+  ],
+  "room_label_count": 7,
+  "room_label_rejected_candidates": [
+    {
+      "item": {
+        "bbox": {
+          "x": 859,
+          "y": 363,
+          "width": 30,
+          "height": 21
+        },
+        "text": null,
+        "confidence": 0.35
+      },
+      "reason": "文字为问号/空值且位置无法可靠映射为房间功能"
+    }
+  ],
+  "room_label_question_mark_count": 0,
+  "rejected_doors": 0,
+  "rejected_difference_components": [],
+  "converted_wall_polylines": 0,
+  "doors": [
+    {
+      "id": "D01",
+      "status": "ACCEPTED_IMAGE_ONLY",
+      "reason": "门型方向为水平，但附近未找到水平墙体的两条墙面线",
+      "pixel": {
+        "kind": "swing_single",
+        "x": 968,
+        "y": 918,
+        "width": 95,
+        "height": 85,
+        "leaves": [
+          {
+            "center_x": 1042.0,
+            "center_y": 992.0,
+            "radius": 74.0,
+            "quadrant_start_image_deg": 180,
+            "leaf_image_angle_deg": 270,
+            "confidence": 0.893
+          }
+        ],
+        "confidence": 0.893,
+        "orientation_hint": "horizontal"
+      },
+      "mapped_cad": {
+        "kind": "swing_single",
+        "orientation": "horizontal",
+        "start": 7225.082,
+        "end": 8099.455,
+        "face1": 417.77453271028037,
+        "face2": 537.7745327102804,
+        "confidence": 0.893,
+        "leaves": [
+          {
+            "center_x": 1042.0,
+            "center_y": 992.0,
+            "radius": 74.0,
+            "quadrant_start_image_deg": 180,
+            "leaf_image_angle_deg": 270,
+            "confidence": 0.893
+          }
+        ]
+      },
+      "bbox_constraint": {
+        "bbox_start_cad": 7225.082,
+        "bbox_end_cad": 8099.455,
+        "bbox_max_width_mm": 874.373,
+        "original_width_mm": 874.373,
+        "generated_width_mm": 874.373,
+        "clamped": false
+      },
+      "removed_misclassified_windows": 0,
+      "geometry": [
+        {
+          "hinge": [
+            8099.455,
+            91.005
+          ],
+          "curve_type": "ELLIPSE",
+          "radius_mm": 773.54,
+          "radius_x_mm": 874.373,
+          "radius_y_mm": 773.54,
+          "leaf_angle_deg": 90.0,
+          "arc_start_deg": 90.0,
+          "arc_end_deg": 180.0,
+          "bbox_cad": {
+            "xmin": 7225.082,
+            "ymin": 91.005,
+            "xmax": 8099.455,
+            "ymax": 864.544
+          },
+          "leaf_endpoint": [
+            8099.455,
+            864.544
+          ],
+          "hard_bbox_contained": true
+        }
+      ]
+    },
+    {
+      "id": "D02",
+      "status": "ACCEPTED_IMAGE_ONLY",
+      "reason": "门型方向为竖直，但附近未找到竖直墙体的两条墙面线",
+      "pixel": {
+        "kind": "swing_single",
+        "x": 577,
+        "y": 670,
+        "width": 94,
+        "height": 97,
+        "leaves": [
+          {
+            "center_x": 659.0,
+            "center_y": 752.0,
+            "radius": 82.0,
+            "quadrant_start_image_deg": 180,
+            "leaf_image_angle_deg": 180,
+            "confidence": 0.87
+          }
+        ],
+        "confidence": 0.87,
+        "orientation_hint": "vertical"
+      },
+      "mapped_cad": {
+        "kind": "swing_single",
+        "orientation": "vertical",
+        "start": 2238.715,
+        "end": 3121.46,
+        "face1": 3998.931297709924,
+        "face2": 4118.9312977099235,
+        "confidence": 0.87,
+        "leaves": [
+          {
+            "center_x": 659.0,
+            "center_y": 752.0,
+            "radius": 82.0,
+            "quadrant_start_image_deg": 180,
+            "leaf_image_angle_deg": 180,
+            "confidence": 0.87
+          }
+        ]
+      },
+      "bbox_constraint": {
+        "bbox_start_cad": 2238.715,
+        "bbox_end_cad": 3121.46,
+        "bbox_max_width_mm": 882.745,
+        "original_width_mm": 882.745,
+        "generated_width_mm": 882.745,
+        "clamped": false
+      },
+      "removed_misclassified_windows": 0,
+      "geometry": [
+        {
+          "hinge": [
+            4491.516,
+            2238.715
+          ],
+          "curve_type": "ELLIPSE",
+          "radius_mm": 865.169,
+          "radius_x_mm": 865.169,
+          "radius_y_mm": 882.745,
+          "leaf_angle_deg": 180.0,
+          "arc_start_deg": 90.0,
+          "arc_end_deg": 180.0,
+          "bbox_cad": {
+            "xmin": 3626.347,
+            "ymin": 2238.715,
+            "xmax": 4491.516,
+            "ymax": 3121.46
+          },
+          "leaf_endpoint": [
+            3626.347,
+            2238.715
+          ],
+          "hard_bbox_contained": true
+        }
+      ]
+    },
+    {
+      "id": "D03",
+      "status": "ACCEPTED",
+      "reason": null,
+      "pixel": {
+        "kind": "swing_single",
+        "x": 857,
+        "y": 302,
+        "width": 87,
+        "height": 96,
+        "leaves": [
+          {
+            "center_x": 863.0,
+            "center_y": 383.0,
+            "radius": 81.0,
+            "quadrant_start_image_deg": 270,
+            "leaf_image_angle_deg": 270,
+            "confidence": 0.854
+          }
+        ],
+        "confidence": 0.854,
+        "orientation_hint": "horizontal"
+      },
+      "cad": {
+        "kind": "swing_single",
+        "orientation": "horizontal",
+        "start": 6203.446,
+        "end": 7004.188,
+        "face1": 6447.681,
+        "face2": 6584.188,
+        "confidence": 0.854,
+        "leaves": [
+          {
+            "center_x": 863.0,
+            "center_y": 383.0,
+            "radius": 81.0,
+            "quadrant_start_image_deg": 270,
+            "leaf_image_angle_deg": 270,
+            "confidence": 0.854
+          }
+        ]
+      },
+      "bbox_constraint": {
+        "bbox_start_cad": 6203.446,
+        "bbox_end_cad": 7004.188,
+        "bbox_max_width_mm": 800.742,
+        "original_width_mm": 800.742,
+        "generated_width_mm": 800.742,
+        "clamped": false
+      },
+      "opening_state": "EXISTING_OPENING",
+      "cut_wall_entities": 0,
+      "wall_overlaps_before": 0,
+      "wall_overlaps_after": 0,
+      "removed_misclassified_windows": 0,
+      "geometry": [
+        {
+          "hinge": [
+            6203.446,
+            5596.787
+          ],
+          "curve_type": "ELLIPSE",
+          "radius_mm": 800.742,
+          "radius_x_mm": 800.742,
+          "radius_y_mm": 873.645,
+          "leaf_angle_deg": 90.0,
+          "arc_start_deg": 0.0,
+          "arc_end_deg": 90.0,
+          "bbox_cad": {
+            "xmin": 6203.446,
+            "ymin": 5596.787,
+            "xmax": 7004.188,
+            "ymax": 6470.432
+          },
+          "leaf_endpoint": [
+            6203.446,
+            6470.432
+          ],
+          "hard_bbox_contained": true
+        }
+      ]
+    },
+    {
+      "id": "D04",
+      "status": "ACCEPTED_IMAGE_ONLY",
+      "reason": "门型方向为竖直，但附近未找到竖直墙体的两条墙面线",
+      "pixel": {
+        "kind": "swing_single",
+        "x": 537,
+        "y": 797,
+        "width": 88,
+        "height": 88,
+        "leaves": [
+          {
+            "center_x": 616.0,
+            "center_y": 806.0,
+            "radius": 79.0,
+            "quadrant_start_image_deg": 90,
+            "leaf_image_angle_deg": 180,
+            "confidence": 0.847
+          }
+        ],
+        "confidence": 0.847,
+        "orientation_hint": "vertical"
+      },
+      "mapped_cad": {
+        "kind": "swing_single",
+        "orientation": "vertical",
+        "start": 1164.86,
+        "end": 1965.701,
+        "face1": 3603.1624863685934,
+        "face2": 3723.1624863685934,
+        "confidence": 0.847,
+        "leaves": [
+          {
+            "center_x": 616.0,
+            "center_y": 806.0,
+            "radius": 79.0,
+            "quadrant_start_image_deg": 90,
+            "leaf_image_angle_deg": 180,
+            "confidence": 0.847
+          }
+        ]
+      },
+      "bbox_constraint": {
+        "bbox_start_cad": 1164.86,
+        "bbox_end_cad": 1965.701,
+        "bbox_max_width_mm": 800.841,
+        "original_width_mm": 800.841,
+        "generated_width_mm": 800.841,
+        "clamped": false
+      },
+      "removed_misclassified_windows": 0,
+      "geometry": [
+        {
+          "hinge": [
+            4068.135,
+            1965.701
+          ],
+          "curve_type": "ELLIPSE",
+          "radius_mm": 800.841,
+          "radius_x_mm": 809.945,
+          "radius_y_mm": 800.841,
+          "leaf_angle_deg": 180.0,
+          "arc_start_deg": 180.0,
+          "arc_end_deg": 270.0,
+          "bbox_cad": {
+            "xmin": 3258.19,
+            "ymin": 1164.86,
+            "xmax": 4068.135,
+            "ymax": 1965.701
+          },
+          "leaf_endpoint": [
+            3258.19,
+            1965.701
+          ],
+          "hard_bbox_contained": true
+        }
+      ]
+    },
+    {
+      "id": "D05",
+      "status": "ACCEPTED_IMAGE_ONLY",
+      "reason": "门型方向为竖直，但附近未找到竖直墙体的两条墙面线",
+      "pixel": {
+        "kind": "swing_single",
+        "x": 762,
+        "y": 790,
+        "width": 90,
+        "height": 90,
+        "leaves": [
+          {
+            "center_x": 771.0,
+            "center_y": 799.0,
+            "radius": 81.0,
+            "quadrant_start_image_deg": 0,
+            "leaf_image_angle_deg": 0,
+            "confidence": 0.847
+          }
+        ],
+        "confidence": 0.847,
+        "orientation_hint": "vertical"
+      },
+      "mapped_cad": {
+        "kind": "swing_single",
+        "orientation": "vertical",
+        "start": 1210.362,
+        "end": 2029.404,
+        "face1": 5683.2497273718645,
+        "face2": 5803.2497273718645,
+        "confidence": 0.847,
+        "leaves": [
+          {
+            "center_x": 771.0,
+            "center_y": 799.0,
+            "radius": 81.0,
+            "quadrant_start_image_deg": 0,
+            "leaf_image_angle_deg": 0,
+            "confidence": 0.847
+          }
+        ]
+      },
+      "bbox_constraint": {
+        "bbox_start_cad": 1210.362,
+        "bbox_end_cad": 2029.404,
+        "bbox_max_width_mm": 819.042,
+        "original_width_mm": 819.042,
+        "generated_width_mm": 819.042,
+        "clamped": false
+      },
+      "removed_misclassified_windows": 0,
+      "geometry": [
+        {
+          "hinge": [
+            5329.073,
+            2029.404
+          ],
+          "curve_type": "ELLIPSE",
+          "radius_mm": 819.042,
+          "radius_x_mm": 828.353,
+          "radius_y_mm": 819.042,
+          "leaf_angle_deg": 0.0,
+          "arc_start_deg": 270.0,
+          "arc_end_deg": 0.0,
+          "bbox_cad": {
+            "xmin": 5329.073,
+            "ymin": 1210.362,
+            "xmax": 6157.426,
+            "ymax": 2029.404
+          },
+          "leaf_endpoint": [
+            6157.426,
+            2029.404
+          ],
+          "hard_bbox_contained": true
+        }
+      ]
+    }
+  ],
+  "topology": {
+    "wall_overlaps_after": 0,
+    "wall_topology": "source-image-preserved",
+    "door_lines": 5,
+    "door_arcs": 5,
+    "circular_door_arcs": 0,
+    "elliptical_door_arcs": 5,
+    "closed_sliding_panels": 0,
+    "door_geometry_collisions": [
+      {
+        "door_handle": "13C",
+        "door_type": "LINE",
+        "target_layer": "WALLS",
+        "target_type": "LWPOLYLINE",
+        "point": [
+          8099.455,
+          180.0
+        ],
+        "collinear_overlap": false
+      },
+      {
+        "door_handle": "13F",
+        "door_type": "ELLIPSE",
+        "target_layer": "WALLS",
+        "target_type": "LWPOLYLINE",
+        "point": [
+          4373.371,
+          3112.36
+        ],
+        "collinear_overlap": false
+      },
+      {
+        "door_handle": "140",
+        "door_type": "LINE",
+        "target_layer": "WALLS",
+        "target_type": "LWPOLYLINE",
+        "point": [
+          6203.446,
+          5720.0
+        ],
+        "collinear_overlap": false
+      },
+      {
+        "door_handle": "140",
+        "door_type": "LINE",
+        "target_layer": "WALLS",
+        "target_type": "LWPOLYLINE",
+        "point": [
+          6203.446,
+          5900.0
+        ],
+        "collinear_overlap": false
+      },
+      {
+        "door_handle": "144",
+        "door_type": "LINE",
+        "target_layer": "WALLS",
+        "target_type": "LWPOLYLINE",
+        "point": [
+          5393.501,
+          2029.404
+        ],
+        "collinear_overlap": false
+      },
+      {
+        "door_handle": "145",
+        "door_type": "ELLIPSE",
+        "target_layer": "WALLS",
+        "target_type": "LWPOLYLINE",
+        "point": [
+          5365.715,
+          1211.944
+        ],
+        "collinear_overlap": false
+      }
+    ],
+    "door_geometry_collision_count": 6
+  },
+  "audit_errors": 0,
+  "audit_fixes": 0,
+  "target_cad_visual_check": false,
+  "stage_status": "needs_repair",
+  "repair_queue": [
+    "门线与墙体或窗线相交（共 6 处）"
+  ]
+}

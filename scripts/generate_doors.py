@@ -20,7 +20,7 @@ import cv2
 import ezdxf
 import numpy as np
 from ezdxf.enums import TextEntityAlignment
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 
 DEFAULT_WIDTH_MM = 10700.0
@@ -30,6 +30,7 @@ WALL_LAYERS = {"WALLS", "INNER_WALLS"}
 WINDOW_LAYER = "WINDOWS"
 DOOR_LAYER = "DOORS"
 ROOM_LAYER = "ROOM_NAMES"
+CHINESE_FONT = "msyh.ttc"
 
 
 @dataclass(frozen=True)
@@ -1221,12 +1222,18 @@ def draw_preview(doc, path: Path, overall_width_mm: float, overall_height_mm: fl
     height = int(overall_height_mm * scale + margin * 2)
     image = Image.new("RGB", (width, height), "white")
     draw = ImageDraw.Draw(image)
+    try:
+        room_font = ImageFont.truetype(
+            r"C:\Windows\Fonts\msyh.ttc", max(16, int(260 * scale))
+        )
+    except OSError:
+        room_font = None
 
     def point(x: float, y: float) -> tuple[float, float]:
         return margin + x * scale, height - margin - y * scale
 
     for entity in doc.modelspace():
-        if entity.dxf.layer not in WALL_LAYERS | {WINDOW_LAYER, DOOR_LAYER}:
+        if entity.dxf.layer not in WALL_LAYERS | {WINDOW_LAYER, DOOR_LAYER, ROOM_LAYER}:
             continue
         color = (210, 40, 40) if entity.dxf.layer == DOOR_LAYER else ((0, 160, 185) if entity.dxf.layer == WINDOW_LAYER else (0, 0, 0))
         if entity.dxftype() == "LINE":
@@ -1249,6 +1256,16 @@ def draw_preview(doc, path: Path, overall_width_mm: float, overall_height_mm: fl
                 points = [point(*segments[0][0])] + [point(*segment[1]) for segment in segments]
             if len(points) >= 2:
                 draw.line(points, fill=color, width=2)
+        elif entity.dxftype() == "TEXT" and entity.dxf.layer == ROOM_LAYER and room_font is not None:
+            text = str(entity.dxf.text).strip()
+            if is_valid_room_name(text):
+                draw.text(
+                    point(float(entity.dxf.insert.x), float(entity.dxf.insert.y)),
+                    text,
+                    font=room_font,
+                    fill=(30, 110, 30),
+                    anchor="mm",
+                )
     path.parent.mkdir(parents=True, exist_ok=True)
     image.save(path)
 
@@ -1324,41 +1341,132 @@ def load_preprocessing_doors(path: Path | None) -> list[PixelDoor]:
     return result
 
 
-def add_inferred_room_labels(
+def is_valid_room_name(value: object) -> bool:
+    name = str(value or "").strip()
+    return bool(name) and "?" not in name and "？" not in name and any(
+        "\u4e00" <= character <= "\u9fff" for character in name
+    )
+
+
+def room_label_position(item: dict) -> list[float] | None:
+    position = item.get("position_px")
+    if isinstance(position, (list, tuple)) and len(position) == 2:
+        return [float(position[0]), float(position[1])]
+    room_bbox = item.get("bbox_px") or item.get("bbox")
+    if isinstance(room_bbox, dict):
+        return [
+            float(room_bbox.get("x", 0)) + float(room_bbox.get("width", 0)) / 2.0,
+            float(room_bbox.get("y", 0)) + float(room_bbox.get("height", 0)) / 2.0,
+        ]
+    if isinstance(room_bbox, (list, tuple)) and len(room_bbox) == 4:
+        return [
+            float(room_bbox[0]) + float(room_bbox[2]) / 2.0,
+            float(room_bbox[1]) + float(room_bbox[3]) / 2.0,
+        ]
+    return None
+
+
+def infer_room_name_from_position(
+    position: Sequence[float], bbox: tuple[int, int, int, int]
+) -> str | None:
+    """Infer common residential room names from a detected label's plan position."""
+    x1, y1, x2, y2 = bbox
+    x_ratio = (float(position[0]) - x1) / max(x2 - x1, 1)
+    y_ratio = (float(position[1]) - y1) / max(y2 - y1, 1)
+    if y_ratio < 0.28:
+        if x_ratio >= 0.80:
+            return "阳台"
+        if x_ratio <= 0.50:
+            return "飘窗"
+        return None
+    if y_ratio < 0.68:
+        if x_ratio <= 0.55:
+            return "主卧"
+        if x_ratio >= 0.65:
+            return "客厅"
+        return None
+    if x_ratio <= 0.47:
+        return "厨房"
+    if x_ratio <= 0.68:
+        return "卫生间"
+    if x_ratio >= 0.78:
+        return "门厅"
+    return None
+
+
+def load_required_room_labels(
+    inferred_path: Path | None,
+    preprocessing_result: Path | None,
+    bbox: tuple[int, int, int, int],
+) -> tuple[list[dict], list[dict]]:
+    """Return drawable Chinese labels; never pass an OCR question-mark through."""
+    source_items: list[dict] = []
+    if inferred_path is not None:
+        data = json.loads(inferred_path.read_text(encoding="utf-8"))
+        raw_items = data.get("rooms", []) if isinstance(data, dict) else data
+        if not isinstance(raw_items, list):
+            raise ValueError("房间名称 JSON 必须是数组或包含 rooms 数组")
+        source_items.extend(item for item in raw_items if isinstance(item, dict))
+    if preprocessing_result is not None and preprocessing_result.exists():
+        data = json.loads(preprocessing_result.read_text(encoding="utf-8"))
+        source_items.extend(item for item in data.get("room_labels", []) if isinstance(item, dict))
+
+    labels: list[dict] = []
+    skipped: list[dict] = []
+    used_names: set[str] = set()
+    for item in source_items:
+        position = room_label_position(item)
+        if position is None:
+            skipped.append({"item": item, "reason": "缺少房间文字位置"})
+            continue
+        raw_name = str(item.get("name", item.get("text", ""))).strip()
+        if is_valid_room_name(raw_name):
+            name = raw_name
+            source = str(item.get("source", "OCR_DETECTED"))
+            confidence = float(item.get("confidence", 0.72))
+        else:
+            name = infer_room_name_from_position(position, bbox)
+            source = "INFERRED_VISUAL"
+            confidence = float(item.get("confidence", 0.60))
+            if name is None:
+                skipped.append({
+                    "item": item,
+                    "reason": "文字为问号/空值且位置无法可靠映射为房间功能",
+                })
+                continue
+        if name in used_names:
+            continue
+        used_names.add(name)
+        labels.append({
+            "name": name,
+            "position_px": position,
+            "source": source,
+            "confidence": confidence,
+        })
+
+    return labels, skipped
+
+
+def add_required_room_labels(
     doc,
     msp,
-    path: Path | None,
+    items: Sequence[dict],
     bbox: tuple[int, int, int, int],
     overall_width_mm: float,
     overall_height_mm: float,
 ) -> list[dict]:
-    if path is None:
-        return []
-    data = json.loads(path.read_text(encoding="utf-8"))
-    items = data.get("rooms", []) if isinstance(data, dict) else data
-    if not isinstance(items, list):
-        raise ValueError("房间名称 JSON 必须是数组或包含 rooms 数组")
     if ROOM_LAYER not in doc.layers:
         doc.layers.add(ROOM_LAYER, color=3, linetype="CONTINUOUS")
     style_name = "FP-TEXT"
     if style_name not in doc.styles:
-        doc.styles.add(style_name, font="msyh.ttf")
+        doc.styles.add(style_name, font=CHINESE_FONT)
     text_height = max(220.0, min(420.0, min(overall_width_mm, overall_height_mm) / 32.0))
     records: list[dict] = []
     for index, item in enumerate(items, start=1):
-        if not isinstance(item, dict) or not str(item.get("name", "")).strip():
+        if not isinstance(item, dict) or not is_valid_room_name(item.get("name")):
             continue
         name = str(item["name"]).strip()
-        position = item.get("position_px")
-        if not position:
-            room_bbox = item.get("bbox_px") or item.get("bbox")
-            if isinstance(room_bbox, dict):
-                position = [
-                    float(room_bbox.get("x", 0)) + float(room_bbox.get("width", 0)) / 2.0,
-                    float(room_bbox.get("y", 0)) + float(room_bbox.get("height", 0)) / 2.0,
-                ]
-            elif isinstance(room_bbox, (list, tuple)) and len(room_bbox) == 4:
-                position = [float(room_bbox[0]) + float(room_bbox[2]) / 2.0, float(room_bbox[1]) + float(room_bbox[3]) / 2.0]
+        position = room_label_position(item)
         if not isinstance(position, (list, tuple)) or len(position) != 2:
             continue
         cad_position = (
@@ -1376,7 +1484,7 @@ def add_inferred_room_labels(
             "position_px": [float(position[0]), float(position[1])],
             "position_cad": [round(cad_position[0], 3), round(cad_position[1], 3)],
             "text_height": round(text_height, 3),
-            "source": "INFERRED_VISUAL",
+            "source": str(item.get("source", "INFERRED_VISUAL")),
             "confidence": float(item.get("confidence", 0.6)),
         })
     return records
@@ -1584,10 +1692,15 @@ def generate(
     door_geometry_collisions = validate_door_geometry(msp)
     if door_geometry_collisions:
         stage_issues.append(f"门线与墙体或窗线相交（共 {len(door_geometry_collisions)} 处）")
-    room_labels = add_inferred_room_labels(
+    required_room_labels, rejected_room_label_candidates = load_required_room_labels(
+        inferred_room_labels,
+        preprocessing_result,
+        plan_bbox,
+    )
+    room_labels = add_required_room_labels(
         doc,
         msp,
-        inferred_room_labels,
+        required_room_labels,
         plan_bbox,
         overall_width_mm,
         overall_height_mm,
@@ -1616,6 +1729,10 @@ def generate(
         ),
         "room_labels": room_labels,
         "room_label_count": len(room_labels),
+        "room_label_rejected_candidates": rejected_room_label_candidates,
+        "room_label_question_mark_count": sum(
+            1 for item in room_labels if "?" in item["name"] or "？" in item["name"]
+        ),
         "rejected_doors": len(records) - len(accepted),
         "rejected_difference_components": rejected_components,
         "converted_wall_polylines": converted,

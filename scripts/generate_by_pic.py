@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 import cv2
@@ -23,6 +24,8 @@ WALL_WIDTHS_MM = [240.0, 180.0, 120.0]
 # Verified against ref_pic_2.jpg: outermost wall-outline extents only.  The
 # dimension strings and extension lines lie outside this rectangle.
 WALL_BBOX_PX = (436, 536, 1465, 1867)
+COLLINEAR_ANGLE_TOLERANCE_DEG = 3.0
+CONTOUR_NOISE_TOLERANCE_PX = 1.25
 
 
 def load_wall_widths(path: Path) -> list[float]:
@@ -509,36 +512,95 @@ def extract_closed_wall_polylines(
     return polylines
 
 
+def _remove_duplicate_vertices(
+    points: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    result: list[tuple[int, int]] = []
+    for point in points:
+        if not result or point != result[-1]:
+            result.append(point)
+    if len(result) > 1 and result[0] == result[-1]:
+        result.pop()
+    return result
+
+
+def _turn_angle_deg(
+    previous: tuple[int, int], current: tuple[int, int], following: tuple[int, int]
+) -> float:
+    first = (current[0] - previous[0], current[1] - previous[1])
+    second = (following[0] - current[0], following[1] - current[1])
+    first_length = math.hypot(*first)
+    second_length = math.hypot(*second)
+    if first_length == 0 or second_length == 0:
+        return 0.0
+    cosine = max(-1.0, min(1.0, (first[0] * second[0] + first[1] * second[1]) / (first_length * second_length)))
+    return math.degrees(math.acos(cosine))
+
+
+def remove_near_collinear_vertices(
+    points: list[tuple[int, int]],
+    angle_tolerance_deg: float = COLLINEAR_ANGLE_TOLERANCE_DEG,
+) -> list[tuple[int, int]]:
+    """Drop every non-corner vertex, including very small angular mask noise."""
+    cleaned = _remove_duplicate_vertices(points)
+    changed = True
+    while changed and len(cleaned) >= 3:
+        changed = False
+        result: list[tuple[int, int]] = []
+        count = len(cleaned)
+        for index, current in enumerate(cleaned):
+            previous = cleaned[(index - 1) % count]
+            following = cleaned[(index + 1) % count]
+            if _turn_angle_deg(previous, current, following) <= angle_tolerance_deg:
+                changed = True
+                continue
+            result.append(current)
+        cleaned = result
+    return cleaned
+
+
+def contour_to_editable_polyline(contour: np.ndarray) -> list[tuple[int, int]]:
+    """Preserve a mask contour as one editable loop with corner-only vertices."""
+    # This first pass only absorbs sub-pixel/raster wobble. It does not bridge
+    # gaps, change wall thickness, snap coordinates, or introduce new corners.
+    approximated = cv2.approxPolyDP(
+        contour, CONTOUR_NOISE_TOLERANCE_PX, True
+    ).reshape(-1, 2)
+    points = [(int(point[0]), int(point[1])) for point in approximated]
+    return remove_near_collinear_vertices(points)
+
+
 def extract_wall_geometry(
     gray: np.ndarray,
 ) -> tuple[
     list[tuple[int, int, int, int]], list[list[tuple[float, float]]], dict
 ]:
     # `gray` is already the canonical binary wall mask rendered as black wall
-    # pixels on white. Pick every contour edge directly. CHAIN_APPROX_NONE is
-    # intentional: no simplification, snapping, merging, morphology, component
-    # filtering, thickness normalization, or topology repair is allowed here.
+    # pixels on white. CHAIN_APPROX_NONE keeps the complete source boundary;
+    # the following operation only turns each *continuous* contour into one
+    # editable polyline and removes redundant non-corner vertices.
     mask = np.uint8(gray < 127) * 255
     contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
-    raw_lines: list[tuple[int, int, int, int]] = []
+    polylines: list[list[tuple[float, float]]] = []
     for contour in contours:
-        points = [(int(point[0][0]), int(point[0][1])) for point in contour]
-        if len(points) < 2:
+        points = contour_to_editable_polyline(contour)
+        if len(points) < 3:
             continue
-        for start, end in zip(points, points[1:] + points[:1]):
-            if start != end:
-                raw_lines.append((start[0], start[1], end[0], end[1]))
+        polylines.append([(float(x), float(y)) for x, y in points])
 
     x1, y1, x2, y2 = WALL_BBOX_PX
-    return raw_lines, [], {
-        "horizontal_boundary_lines": sum(1 for ax, ay, bx, by in raw_lines if ay == by),
-        "vertical_boundary_lines": sum(1 for ax, ay, bx, by in raw_lines if ax == bx),
-        "diagonal_boundary_lines": sum(1 for ax, ay, bx, by in raw_lines if ax != bx and ay != by),
+    boundary_edges = sum(len(item) for item in polylines)
+    return [], polylines, {
+        "horizontal_boundary_lines": 0,
+        "vertical_boundary_lines": 0,
+        "diagonal_boundary_lines": 0,
         "mask_contours": len(contours),
-        "closed_wall_polylines": 0,
-        "closed_wall_boundary_edges": 0,
-        "extraction_mode": "raw-mask-boundary-edges",
-        "edge_pickup_policy": "CHAIN_APPROX_NONE-no-postprocessing",
+        "closed_wall_polylines": len(polylines),
+        "closed_wall_boundary_edges": boundary_edges,
+        "extraction_mode": "continuous-mask-contours-as-lwpolylines",
+        "edge_pickup_policy": "CHAIN_APPROX_NONE-contour-to-editable-lwpolyline",
+        "collinear_angle_tolerance_deg": COLLINEAR_ANGLE_TOLERANCE_DEG,
+        "contour_noise_tolerance_px": CONTOUR_NOISE_TOLERANCE_PX,
         "wall_bbox_px": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
     }
 
@@ -658,6 +720,13 @@ def generate(
         gray, wall_mask, wall_mask_weight
     )
     lines, polylines, stats = extract_wall_geometry(wall_evidence)
+    mask_stats.update({
+        "postprocessing_applied_after_edge_pickup": True,
+        "postprocessing_kind": (
+            "continuous-contour-to-lwpolyline-with-near-collinear-vertex-removal"
+        ),
+        "wall_mask_modified": False,
+    })
     stage_issues: list[str] = []
     # Independent lines are valid source evidence in image-faithful mode.
     # No repair item is created for open walls: closure is deliberately not
@@ -673,7 +742,11 @@ def generate(
         p1 = to_cad((x1, y1))
         p2 = to_cad((x2, y2))
         msp.add_line(p1, p2, dxfattribs={"layer": "WALLS"})
-    for polyline in polylines:
+    cad_polylines = [
+        [to_cad((int(x), int(y))) for x, y in polyline]
+        for polyline in polylines
+    ]
+    for polyline in cad_polylines:
         msp.add_lwpolyline(
             polyline,
             close=True,
@@ -702,7 +775,12 @@ def generate(
         and entity.dxftype() == "LWPOLYLINE"
         and entity.closed
     )
-    wall_geometry_valid = wall_lines > 0 and len(auditor.errors) == 0
+    wall_geometry_valid = (
+        wall_lines == 0
+        and open_wall_polylines == 0
+        and closed_wall_polylines > 0
+        and len(auditor.errors) == 0
+    )
     if not wall_geometry_valid:
         stage_issues.append({
             "stage": "walls",
@@ -711,7 +789,7 @@ def generate(
             "wall_open_polylines": open_wall_polylines,
             "wall_closed_polylines": closed_wall_polylines,
             "audit_errors": len(auditor.errors),
-            "suggested_repair": "检查预处理墙体 mask；墙体阶段不得自行修复边界",
+            "suggested_repair": "检查预处理墙体 mask 与连续轮廓提取结果",
         })
 
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -726,8 +804,8 @@ def generate(
         "wall_boundary_lines": wall_lines,
         "wall_open_polylines": open_wall_polylines,
         "wall_closed_polylines": closed_wall_polylines,
-        "wall_boundary_edges": wall_lines,
-        "wall_topology": "raw-mask-boundaries-unmodified",
+        "wall_boundary_edges": sum(len(item) for item in polylines),
+        "wall_topology": "continuous-editable-lwpolylines",
         "wall_geometry_valid": wall_geometry_valid,
         "ready_for_openings": True,
         "audit_errors": len(auditor.errors),
@@ -740,7 +818,7 @@ def generate(
     output.with_suffix(".json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    write_preview(output.with_suffix(".png"), lines, polylines)
+    write_preview(output.with_suffix(".png"), lines, cad_polylines)
     return report
 
 
