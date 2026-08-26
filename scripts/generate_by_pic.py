@@ -575,32 +575,42 @@ def extract_wall_geometry(
 ) -> tuple[
     list[tuple[int, int, int, int]], list[list[tuple[float, float]]], dict
 ]:
-    # `gray` is already the canonical binary wall mask rendered as black wall
-    # pixels on white. CHAIN_APPROX_NONE keeps the complete source boundary;
-    # the following operation only turns each *continuous* contour into one
-    # editable polyline and removes redundant non-corner vertices.
+    # `gray` is the canonical binary wall mask rendered as black wall pixels
+    # on white. The mask remains the only geometry evidence; this stage turns
+    # its measured strips into straight, orthogonal wall rectangles with a
+    # thickness selected from data.json, then unions those rectangles.
     mask = np.uint8(gray < 127) * 255
-    contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
-    polylines: list[list[tuple[float, float]]] = []
-    for contour in contours:
-        points = contour_to_editable_polyline(contour)
-        if len(points) < 3:
-            continue
-        polylines.append([(float(x), float(y)) for x, y in points])
-
     x1, y1, x2, y2 = WALL_BBOX_PX
+    roi = mask[y1 : y2 + 1, x1 : x2 + 1]
+    if roi.size == 0 or not np.any(roi):
+        raise ValueError("wall-bbox 中没有可用墙体 mask 像素")
+    estimated_thickness = estimate_wall_thickness_px(roi)
+    rectangles, assignments = extract_standard_wall_rectangles(
+        roi, estimated_thickness
+    )
+    if not rectangles:
+        raise ValueError("未能从墙体 mask 提取满足最小长度的直墙条带")
+    polylines = rectangles_to_closed_polylines(rectangles)
     boundary_edges = sum(len(item) for item in polylines)
     return [], polylines, {
         "horizontal_boundary_lines": 0,
         "vertical_boundary_lines": 0,
         "diagonal_boundary_lines": 0,
-        "mask_contours": len(contours),
+        "mask_contours": int(cv2.connectedComponents(roi)[0] - 1),
         "closed_wall_polylines": len(polylines),
         "closed_wall_boundary_edges": boundary_edges,
-        "extraction_mode": "continuous-mask-contours-as-lwpolylines",
-        "edge_pickup_policy": "CHAIN_APPROX_NONE-contour-to-editable-lwpolyline",
+        "extraction_mode": "mask-strips-to-standard-width-orthogonal-lwpolylines",
+        "edge_pickup_policy": "wall-mask-only-orthogonal-strip-reconstruction",
         "collinear_angle_tolerance_deg": COLLINEAR_ANGLE_TOLERANCE_DEG,
         "contour_noise_tolerance_px": CONTOUR_NOISE_TOLERANCE_PX,
+        "estimated_wall_thickness_px": round(estimated_thickness, 3),
+        "wall_width_candidates_mm": WALL_WIDTHS_MM,
+        "wall_width_assignments": assignments,
+        "assigned_wall_widths_mm": sorted(
+            {item["assigned_width_mm"] for item in assignments}
+        ),
+        "wall_strip_rectangle_count": len(rectangles),
+        "polyline_coordinate_space": "cad_mm",
         "wall_bbox_px": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
     }
 
@@ -723,7 +733,7 @@ def generate(
     mask_stats.update({
         "postprocessing_applied_after_edge_pickup": True,
         "postprocessing_kind": (
-            "continuous-contour-to-lwpolyline-with-near-collinear-vertex-removal"
+            "wall-mask-orthogonal-strip-reconstruction-with-standard-width-assignment"
         ),
         "wall_mask_modified": False,
     })
@@ -742,10 +752,9 @@ def generate(
         p1 = to_cad((x1, y1))
         p2 = to_cad((x2, y2))
         msp.add_line(p1, p2, dxfattribs={"layer": "WALLS"})
-    cad_polylines = [
-        [to_cad((int(x), int(y))) for x, y in polyline]
-        for polyline in polylines
-    ]
+    # extract_wall_geometry now returns exact CAD-mm vertices after wall-width
+    # normalization; do not map them through image coordinates a second time.
+    cad_polylines = polylines
     for polyline in cad_polylines:
         msp.add_lwpolyline(
             polyline,
@@ -805,7 +814,7 @@ def generate(
         "wall_open_polylines": open_wall_polylines,
         "wall_closed_polylines": closed_wall_polylines,
         "wall_boundary_edges": sum(len(item) for item in polylines),
-        "wall_topology": "continuous-editable-lwpolylines",
+        "wall_topology": "orthogonal-standard-width-editable-lwpolylines",
         "wall_geometry_valid": wall_geometry_valid,
         "ready_for_openings": True,
         "audit_errors": len(auditor.errors),
