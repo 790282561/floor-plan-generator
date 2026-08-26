@@ -1,10 +1,185 @@
 {
-  "schema_version": 2,
-  "source_image": "D:\\中建科技\\009_自动化软件平台\\pics\\ref_pic_7.jpg",
+  "schema_version": 3,
+  "source_image": "D:\\中建科技\\009_自动化软件平台\\floor-plan-generator\\references\\ref_pic_7.jpg",
   "preprocessing_result": "D:\\中建科技\\009_自动化软件平台\\floor-plan-generator\\outputs\\ref_pic_7_20260825\\preprocessed\\result.json",
   "vision_backend": "opencv_anchor_fusion",
   "multimodal_enabled": true,
+  "processing_order": [
+    "building_outline",
+    "wall",
+    "door",
+    "window"
+  ],
+  "building_outline": {
+    "id": "BUILDING_OUTLINE_01",
+    "class": "building_outline",
+    "type": "building_outline",
+    "bbox": [
+      183,
+      157,
+      917,
+      856
+    ],
+    "bbox_px": {
+      "x": 183,
+      "y": 157,
+      "width": 917,
+      "height": 856
+    },
+    "polygon_px": [
+      [
+        1099,
+        157
+      ],
+      [
+        772,
+        157
+      ],
+      [
+        771,
+        372
+      ],
+      [
+        668,
+        371
+      ],
+      [
+        668,
+        250
+      ],
+      [
+        288,
+        251
+      ],
+      [
+        287,
+        773
+      ],
+      [
+        184,
+        775
+      ],
+      [
+        183,
+        1011
+      ],
+      [
+        1099,
+        1012
+      ]
+    ],
+    "closed": true,
+    "raw_point_count": 3778,
+    "polygon_point_count": 10,
+    "area_px2": 660882.0,
+    "perimeter_px": 3783.799,
+    "plan_bbox_coverage": 1.0,
+    "footprint_area_ratio": 0.8419,
+    "convex_hull_area_px2": 722777.0,
+    "concavity_ratio": 0.0856,
+    "is_concave": true,
+    "opening_bridge_line_count": 258,
+    "score": 0.98,
+    "confidence": 0.98,
+    "status": "DETECTED",
+    "source": "input_image_plus_preprocessed_wall_door_window_masks",
+    "evidence": {
+      "input_image_ink_pixels": 85167,
+      "wall_mask_pixels": 73330,
+      "door_mask_pixels": 3706,
+      "window_mask_pixels": 1516,
+      "wall_mask_modified": false
+    },
+    "reason": "在整张户型图中融合墙体、门、窗边界并闭合已知洞口后提取最大建筑外轮廓"
+  },
+  "building_outline_artifacts": {
+    "outline_mask": "D:\\中建科技\\009_自动化软件平台\\floor-plan-generator\\outputs\\ref_pic_7_20260825\\preprocessed\\masks\\building_outline.png",
+    "footprint_mask": "D:\\中建科技\\009_自动化软件平台\\floor-plan-generator\\outputs\\ref_pic_7_20260825\\preprocessed\\masks\\building_footprint.png",
+    "overlay": "D:\\中建科技\\009_自动化软件平台\\floor-plan-generator\\outputs\\ref_pic_7_20260825\\preprocessed\\building_outline_overlay.png"
+  },
   "semantic_candidates": [
+    {
+      "id": "BUILDING_OUTLINE_01",
+      "class": "building_outline",
+      "type": "building_outline",
+      "bbox": [
+        183,
+        157,
+        917,
+        856
+      ],
+      "bbox_px": {
+        "x": 183,
+        "y": 157,
+        "width": 917,
+        "height": 856
+      },
+      "polygon_px": [
+        [
+          1099,
+          157
+        ],
+        [
+          772,
+          157
+        ],
+        [
+          771,
+          372
+        ],
+        [
+          668,
+          371
+        ],
+        [
+          668,
+          250
+        ],
+        [
+          288,
+          251
+        ],
+        [
+          287,
+          773
+        ],
+        [
+          184,
+          775
+        ],
+        [
+          183,
+          1011
+        ],
+        [
+          1099,
+          1012
+        ]
+      ],
+      "closed": true,
+      "raw_point_count": 3778,
+      "polygon_point_count": 10,
+      "area_px2": 660882.0,
+      "perimeter_px": 3783.799,
+      "plan_bbox_coverage": 1.0,
+      "footprint_area_ratio": 0.8419,
+      "convex_hull_area_px2": 722777.0,
+      "concavity_ratio": 0.0856,
+      "is_concave": true,
+      "opening_bridge_line_count": 258,
+      "score": 0.98,
+      "confidence": 0.98,
+      "status": "DETECTED",
+      "source": "input_image_plus_preprocessed_wall_door_window_masks",
+      "evidence": {
+        "input_image_ink_pixels": 85167,
+        "wall_mask_pixels": 73330,
+        "door_mask_pixels": 3706,
+        "window_mask_pixels": 1516,
+        "wall_mask_modified": false
+      },
+      "reason": "在整张户型图中融合墙体、门、窗边界并闭合已知洞口后提取最大建筑外轮廓"
+    },
     {
       "type": "window_anchor",
       "bbox": [
@@ -245,8 +420,10 @@
     }
   ],
   "notes": [
-    "该融合层仅作为语义候选和几何锚点，不直接替代 generate_by_pic.py / generate_windows.py / generate_doors.py 的最终 CAD 生成。",
-    "阳台顶部转角、窗洞和房间文字仍必须经过拓扑校验和阶段验收。"
+    "先识别整张输入图的建筑外轮廓，再按墙体、门、窗顺序处理后续候选。",
+    "building_outline 只作为外轮廓与后续缺口分析证据，不修改 masks/walls.png，也不直接生成窗图元。",
+    "该融合层不替代 generate_by_pic.py / generate_doors.py / generate_windows.py 的最终 CAD 生成。",
+    "阳台顶部转角、外轮廓缺口、窗洞和房间文字仍必须经过拓扑校验和阶段验收。"
   ],
   "original_report": {
     "schema_version": 1,

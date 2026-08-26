@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""在既有墙体 DXF 上识别并生成真实窗洞及窗框。"""
+"""在既有墙体+门 DXF 上，通过建筑外轮廓剩余缺口生成窗洞及窗框。"""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
+import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -21,6 +22,8 @@ DEFAULT_HEIGHT_MM = 13990.0
 DEFAULT_WALL_WIDTHS_MM = [240.0, 180.0, 120.0]
 WALL_LAYERS = {"WALLS", "INNER_WALLS"}
 WINDOW_LAYER = "WINDOWS"
+DOOR_LAYER = "DOORS"
+ROOM_NAME_LAYER = "ROOM_NAMES"
 
 
 @dataclass(frozen=True)
@@ -46,6 +49,8 @@ class PixelWindow:
     face2: float
     confidence: float
     evidence_line_count: int = 4
+    source: str = "FOUR_LINE_DETECTED"
+    outline_gap_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -406,6 +411,374 @@ def detect_windows(
     return windows, mask
 
 
+def resolve_multimodal_result(
+    explicit_path: Path | None, preprocessing_result: Path | None
+) -> Path | None:
+    if explicit_path is not None:
+        if not explicit_path.exists():
+            raise FileNotFoundError(f"多模态结果不存在：{explicit_path}")
+        return explicit_path
+    if preprocessing_result is None:
+        return None
+    candidate = preprocessing_result.parent / "multimodal.json"
+    return candidate if candidate.exists() else None
+
+
+def load_outline_context(
+    multimodal_result: Path | None, image_shape: tuple[int, int]
+) -> tuple[dict | None, np.ndarray, np.ndarray]:
+    outline_mask = np.zeros(image_shape, dtype=np.uint8)
+    footprint_mask = np.zeros(image_shape, dtype=np.uint8)
+    if multimodal_result is None:
+        return None, outline_mask, footprint_mask
+    data = json.loads(multimodal_result.read_text(encoding="utf-8"))
+    outline = data.get("building_outline")
+    if not isinstance(outline, dict) or not outline.get("closed"):
+        return None, outline_mask, footprint_mask
+    points = np.asarray(outline.get("polygon_px", []), dtype=np.int32)
+    if len(points) < 3:
+        return None, outline_mask, footprint_mask
+    polygon = points.reshape((-1, 1, 2))
+    cv2.polylines(outline_mask, [polygon], True, 255, 2)
+    cv2.fillPoly(footprint_mask, [polygon], 255)
+    return outline, outline_mask, footprint_mask
+
+
+def load_frozen_wall_mask(
+    preprocessing_result: Path | None, image_shape: tuple[int, int]
+) -> tuple[np.ndarray | None, Path | None, str | None]:
+    if preprocessing_result is None:
+        return None, None, None
+    path = preprocessing_result.parent / "masks" / "walls.png"
+    if not path.exists():
+        return None, path, None
+    mask = read_gray(path)
+    if mask.shape != image_shape:
+        raise ValueError(
+            f"墙体 mask 尺寸 {mask.shape[::-1]} 与原图尺寸 {image_shape[::-1]} 不一致"
+        )
+    return np.uint8(mask > 0) * 255, path, file_sha256(path)
+
+
+def load_preprocessing_door_boxes(path: Path | None) -> list[dict]:
+    if path is None or not path.exists():
+        return []
+    data = json.loads(path.read_text(encoding="utf-8"))
+    boxes: list[dict] = []
+    for item in data.get("doors", []):
+        box = item.get("bbox") or {}
+        width = float(box.get("width", 0))
+        height = float(box.get("height", 0))
+        if width > 0 and height > 0:
+            boxes.append({
+                "x": float(box.get("x", 0)),
+                "y": float(box.get("y", 0)),
+                "width": width,
+                "height": height,
+                "source": "preprocessing-door-bbox",
+            })
+    return boxes
+
+
+def _entity_xy_points(entity) -> list[tuple[float, float]]:
+    kind = entity.dxftype()
+    if kind == "LINE":
+        return [
+            (float(entity.dxf.start.x), float(entity.dxf.start.y)),
+            (float(entity.dxf.end.x), float(entity.dxf.end.y)),
+        ]
+    if kind == "LWPOLYLINE":
+        return [(float(x), float(y)) for x, y in entity.get_points("xy")]
+    if kind == "ARC":
+        start = float(entity.dxf.start_angle)
+        end = float(entity.dxf.end_angle)
+        if end < start:
+            end += 360.0
+        steps = max(8, int(math.ceil((end - start) / 5.0)))
+        center = entity.dxf.center
+        radius = float(entity.dxf.radius)
+        return [
+            (
+                float(center.x) + radius * math.cos(math.radians(start + (end - start) * i / steps)),
+                float(center.y) + radius * math.sin(math.radians(start + (end - start) * i / steps)),
+            )
+            for i in range(steps + 1)
+        ]
+    if kind == "ELLIPSE":
+        center = entity.dxf.center
+        major = entity.dxf.major_axis
+        ratio = float(entity.dxf.ratio)
+        minor = (-float(major.y) * ratio, float(major.x) * ratio)
+        start = float(entity.dxf.start_param)
+        end = float(entity.dxf.end_param)
+        if end < start:
+            end += math.tau
+        return [
+            (
+                float(center.x) + float(major.x) * math.cos(t) + minor[0] * math.sin(t),
+                float(center.y) + float(major.y) * math.cos(t) + minor[1] * math.sin(t),
+            )
+            for t in np.linspace(start, end, 25)
+        ]
+    return []
+
+
+def load_dxf_door_boxes(
+    msp,
+    plan_bbox: tuple[int, int, int, int],
+    overall_width_mm: float,
+    overall_height_mm: float,
+) -> list[dict]:
+    x1, y1, x2, y2 = plan_bbox
+
+    def pixel_x(value: float) -> float:
+        return x1 + value * (x2 - x1) / overall_width_mm
+
+    def pixel_y(value: float) -> float:
+        return y2 - value * (y2 - y1) / overall_height_mm
+
+    boxes: list[dict] = []
+    for entity in msp:
+        if entity.dxf.layer != DOOR_LAYER:
+            continue
+        points = _entity_xy_points(entity)
+        if not points:
+            continue
+        xs = [pixel_x(point[0]) for point in points]
+        ys = [pixel_y(point[1]) for point in points]
+        boxes.append({
+            "x": min(xs),
+            "y": min(ys),
+            "width": max(max(xs) - min(xs), 1.0),
+            "height": max(max(ys) - min(ys), 1.0),
+            "source": f"dxf-{entity.dxftype().lower()}",
+            "handle": entity.dxf.handle,
+        })
+    return boxes
+
+
+def _point_in_door_box(x: float, y: float, boxes: Sequence[dict], padding: float = 3.0) -> bool:
+    for box in boxes:
+        x1 = float(box["x"]) - padding
+        y1 = float(box["y"]) - padding
+        x2 = float(box["x"]) + float(box["width"]) + padding
+        y2 = float(box["y"]) + float(box["height"]) + padding
+        if x1 <= x <= x2 and y1 <= y <= y2:
+            return True
+    return False
+
+
+def _continuous_false_runs(values: np.ndarray, minimum: int) -> list[tuple[int, int]]:
+    runs: list[tuple[int, int]] = []
+    start: int | None = None
+    for index, value in enumerate(values.tolist() + [True]):
+        if not value and start is None:
+            start = index
+        elif value and start is not None:
+            if index - start >= minimum:
+                runs.append((start, index - 1))
+            start = None
+    return runs
+
+
+def _inward_sign(
+    footprint_mask: np.ndarray, orientation: str, axis: int, middle: int, probe: int
+) -> int:
+    height, width = footprint_mask.shape
+    if orientation == "horizontal":
+        negative = footprint_mask[max(0, axis - probe), min(width - 1, middle)] > 0
+        positive = footprint_mask[min(height - 1, axis + probe), min(width - 1, middle)] > 0
+    else:
+        negative = footprint_mask[min(height - 1, middle), max(0, axis - probe)] > 0
+        positive = footprint_mask[min(height - 1, middle), min(width - 1, axis + probe)] > 0
+    if positive and not negative:
+        return 1
+    if negative and not positive:
+        return -1
+    return 1
+
+
+def _gap_face_axes(
+    gray: np.ndarray,
+    footprint_mask: np.ndarray,
+    orientation: str,
+    start: int,
+    end: int,
+    outline_axis: int,
+    wall_width_px: float,
+) -> tuple[float, float, float, int]:
+    height, width = gray.shape
+    middle = (start + end) // 2
+    sign = _inward_sign(
+        footprint_mask, orientation, outline_axis, middle, max(4, int(round(wall_width_px * 0.65)))
+    )
+    distance = max(5, int(round(wall_width_px * 1.55)))
+    low = outline_axis - 3 if sign > 0 else outline_axis - distance
+    high = outline_axis + distance if sign > 0 else outline_axis + 3
+    ink = gray < 210
+    trim = max(1, int((end - start + 1) * 0.08))
+    along_start = start + trim
+    along_end = max(along_start + 1, end - trim + 1)
+    if orientation == "horizontal":
+        low, high = max(0, low), min(height - 1, high)
+        scores = np.count_nonzero(ink[low : high + 1, along_start:along_end], axis=1)
+    else:
+        low, high = max(0, low), min(width - 1, high)
+        scores = np.count_nonzero(ink[along_start:along_end, low : high + 1], axis=0)
+    threshold = max(3, int((along_end - along_start) * 0.28))
+    supported = np.flatnonzero(scores >= threshold) + low
+    clusters: list[list[int]] = []
+    for value in supported.tolist():
+        if not clusters or value > clusters[-1][-1] + 2:
+            clusters.append([value])
+        else:
+            clusters[-1].append(value)
+    axes = [float(np.median(group)) for group in clusters]
+    if len(axes) >= 2:
+        face1, face2 = min(axes), max(axes)
+        evidence_count = min(4, len(axes))
+    else:
+        face1 = float(outline_axis)
+        face2 = float(outline_axis + sign * wall_width_px)
+        face1, face2 = sorted((face1, face2))
+        evidence_count = len(axes)
+    return face1, (face1 + face2) / 2.0, face2, evidence_count
+
+
+def detect_outline_gap_windows(
+    gray: np.ndarray,
+    wall_mask: np.ndarray,
+    footprint_mask: np.ndarray,
+    outline: dict,
+    door_boxes: Sequence[dict],
+    plan_bbox: tuple[int, int, int, int],
+    overall_width_mm: float,
+    overall_height_mm: float,
+    wall_widths_mm: Sequence[float],
+) -> tuple[list[PixelWindow], np.ndarray, list[dict]]:
+    points = [tuple(map(int, point)) for point in outline.get("polygon_px", [])]
+    gap_mask = np.zeros_like(gray)
+    windows: list[PixelWindow] = []
+    diagnostics: list[dict] = []
+    x1, y1, x2, y2 = plan_bbox
+    horizontal_wall_px = max(wall_widths_mm) * (y2 - y1) / overall_height_mm
+    vertical_wall_px = max(wall_widths_mm) * (x2 - x1) / overall_width_mm
+    height, width = gray.shape
+    for segment_index, (first, second) in enumerate(zip(points, points[1:] + points[:1]), start=1):
+        dx, dy = second[0] - first[0], second[1] - first[1]
+        if abs(dx) >= max(4, abs(dy) * 4):
+            orientation = "horizontal"
+            axis = int(round((first[1] + second[1]) / 2.0))
+            seg_start, seg_end = sorted((first[0], second[0]))
+            wall_width_px = horizontal_wall_px
+            minimum = max(10, int(round(300.0 * (x2 - x1) / overall_width_mm)))
+        elif abs(dy) >= max(4, abs(dx) * 4):
+            orientation = "vertical"
+            axis = int(round((first[0] + second[0]) / 2.0))
+            seg_start, seg_end = sorted((first[1], second[1]))
+            wall_width_px = vertical_wall_px
+            minimum = max(10, int(round(300.0 * (y2 - y1) / overall_height_mm)))
+        else:
+            diagnostics.append({"segment": segment_index, "status": "SKIPPED_NON_ORTHOGONAL"})
+            continue
+        seg_start = max(0, seg_start)
+        seg_end = min((width - 1) if orientation == "horizontal" else (height - 1), seg_end)
+        if seg_end - seg_start + 1 < minimum:
+            continue
+        band = max(4, int(round(wall_width_px * 1.25)))
+        covered: list[bool] = []
+        for along in range(seg_start, seg_end + 1):
+            if orientation == "horizontal":
+                yy1, yy2 = max(0, axis - band), min(height, axis + band + 1)
+                xx1, xx2 = max(0, along - 1), min(width, along + 2)
+                wall_covered = bool(np.any(wall_mask[yy1:yy2, xx1:xx2]))
+                door_covered = _point_in_door_box(along, axis, door_boxes)
+            else:
+                xx1, xx2 = max(0, axis - band), min(width, axis + band + 1)
+                yy1, yy2 = max(0, along - 1), min(height, along + 2)
+                wall_covered = bool(np.any(wall_mask[yy1:yy2, xx1:xx2]))
+                door_covered = _point_in_door_box(axis, along, door_boxes)
+            covered.append(wall_covered or door_covered)
+        coverage = np.asarray(covered, dtype=np.uint8)
+        coverage = cv2.morphologyEx(coverage.reshape(1, -1), cv2.MORPH_CLOSE, np.ones((1, 5), np.uint8)).reshape(-1).astype(bool)
+        runs = _continuous_false_runs(coverage, minimum)
+        diagnostics.append({
+            "segment": segment_index,
+            "orientation": orientation,
+            "axis": axis,
+            "start": seg_start,
+            "end": seg_end,
+            "gap_runs": len(runs),
+        })
+        for run_index, (relative_start, relative_end) in enumerate(runs, start=1):
+            start = seg_start + relative_start
+            end = seg_start + relative_end
+            face1, center, face2, evidence_count = _gap_face_axes(
+                gray, footprint_mask, orientation, start, end, axis, wall_width_px
+            )
+            confidence = 0.94 if evidence_count >= 4 else 0.87 if evidence_count >= 2 else 0.8
+            gap_id = f"OUTLINE_S{segment_index:02d}_G{run_index:02d}"
+            item = PixelWindow(
+                orientation=orientation,
+                start=float(start),
+                end=float(end),
+                face1=face1,
+                center=center,
+                face2=face2,
+                confidence=confidence,
+                evidence_line_count=evidence_count,
+                source="OUTLINE_GAP_CONFIRMED" if evidence_count >= 2 else "OUTLINE_GAP_INFERRED",
+                outline_gap_id=gap_id,
+            )
+            windows.append(item)
+            if orientation == "horizontal":
+                cv2.rectangle(gap_mask, (start, int(round(face1))), (end, int(round(face2))), 255, -1)
+            else:
+                cv2.rectangle(gap_mask, (int(round(face1)), start), (int(round(face2)), end), 255, -1)
+    return windows, gap_mask, diagnostics
+
+
+def merge_outline_and_line_evidence(
+    outline_windows: Sequence[PixelWindow], line_windows: Sequence[PixelWindow]
+) -> tuple[list[PixelWindow], list[dict]]:
+    merged: list[PixelWindow] = []
+    unmatched = list(line_windows)
+    for outline in outline_windows:
+        match = None
+        for line in unmatched:
+            overlap = max(0.0, min(outline.end, line.end) - max(outline.start, line.start))
+            shorter = min(outline.end - outline.start, line.end - line.start)
+            if (
+                outline.orientation == line.orientation
+                and shorter > 0
+                and overlap >= shorter * 0.45
+                and abs(outline.center - line.center) <= max(10.0, abs(outline.face2 - outline.face1) * 1.5)
+            ):
+                match = line
+                break
+        if match is None:
+            merged.append(outline)
+            continue
+        unmatched.remove(match)
+        merged.append(PixelWindow(
+            orientation=outline.orientation,
+            start=outline.start,
+            end=outline.end,
+            face1=match.face1,
+            center=match.center,
+            face2=match.face2,
+            confidence=max(0.96, outline.confidence, match.confidence),
+            evidence_line_count=4,
+            source="OUTLINE_GAP+FOUR_LINE_CONFIRMED",
+            outline_gap_id=outline.outline_gap_id,
+        ))
+    rejected = [
+        {"window": asdict(item), "reason": "四线候选不位于建筑外轮廓的墙体/门剩余缺口上"}
+        for item in unmatched
+    ]
+    return merged, rejected
+
+
 def to_cad_window(
     item: PixelWindow,
     plan_bbox: tuple[int, int, int, int],
@@ -429,6 +802,8 @@ def to_cad_window(
             face_values[0],
             face_values[1],
             item.confidence,
+            source=item.source,
+            evidence_line_count=item.evidence_line_count,
         )
     face_values = sorted((cad_x(item.face1), cad_x(item.face2)))
     return CadWindow(
@@ -438,6 +813,8 @@ def to_cad_window(
         face_values[0],
         face_values[1],
         item.confidence,
+        source=item.source,
+        evidence_line_count=item.evidence_line_count,
     )
 
 
@@ -539,6 +916,8 @@ def normalize_window_to_wall(
             face1=round(face1, 3),
             face2=round(face2, 3),
             confidence=item.confidence,
+            source=item.source,
+            evidence_line_count=item.evidence_line_count,
         ),
         None,
     )
@@ -832,12 +1211,15 @@ def write_detection_artifacts(
     plan_bbox: tuple[int, int, int, int],
     windows: Sequence[PixelWindow],
     output: Path,
+    outline_mask: np.ndarray | None = None,
 ) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     cv2.imencode(".png", mask)[1].tofile(str(output.with_name(output.stem + "_window_mask.png")))
     overlay = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
     x1, y1, x2, y2 = plan_bbox
     cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 170, 0), 2)
+    if outline_mask is not None and np.any(outline_mask):
+        overlay[outline_mask > 0] = (0, 0, 220)
     for item in windows:
         if item.orientation == "horizontal":
             first = (int(round(item.start)), int(round(item.face1)))
@@ -861,9 +1243,14 @@ def draw_preview(doc, path: Path, overall_width_mm: float, overall_height_mm: fl
         return margin + x * scale, height - margin - y * scale
 
     for entity in doc.modelspace():
-        if entity.dxf.layer not in WALL_LAYERS | {WINDOW_LAYER}:
+        if entity.dxf.layer not in WALL_LAYERS | {WINDOW_LAYER, DOOR_LAYER}:
             continue
-        color = (0, 160, 185) if entity.dxf.layer == WINDOW_LAYER else (0, 0, 0)
+        if entity.dxf.layer == WINDOW_LAYER:
+            color = (0, 160, 185)
+        elif entity.dxf.layer == DOOR_LAYER:
+            color = (185, 80, 40)
+        else:
+            color = (0, 0, 0)
         if entity.dxftype() == "LINE":
             draw.line(
                 (point(float(entity.dxf.start.x), float(entity.dxf.start.y)), point(float(entity.dxf.end.x), float(entity.dxf.end.y))),
@@ -874,6 +1261,10 @@ def draw_preview(doc, path: Path, overall_width_mm: float, overall_height_mm: fl
             points = [point(float(x), float(y)) for x, y in entity.get_points("xy")]
             if entity.closed and points:
                 points.append(points[0])
+            if len(points) >= 2:
+                draw.line(points, fill=color, width=2)
+        elif entity.dxftype() in {"ARC", "ELLIPSE"}:
+            points = [point(x, y) for x, y in _entity_xy_points(entity)]
             if len(points) >= 2:
                 draw.line(points, fill=color, width=2)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -889,6 +1280,7 @@ def load_preprocessing_evidence(path: Path | None) -> dict | None:
     return {
         "path": str(path.resolve()),
         "walls": len(data.get("walls", [])),
+        "doors": len(data.get("doors", [])),
         "windows": len(data.get("windows", [])),
         "warnings": data.get("warnings", []),
     }
@@ -934,12 +1326,10 @@ def load_preprocessing_windows(path: Path | None) -> list[PixelWindow]:
 
 
 def suppress_windows_in_door_arc_regions(
-    windows: Sequence[PixelWindow], path: Path | None
+    windows: Sequence[PixelWindow], door_boxes: Sequence[dict]
 ) -> tuple[list[PixelWindow], list[dict]]:
-    if path is None or not path.exists():
+    if not door_boxes:
         return list(windows), []
-    data = json.loads(path.read_text(encoding="utf-8"))
-    door_boxes = [item.get("bbox") or {} for item in data.get("doors", [])]
     kept: list[PixelWindow] = []
     suppressed: list[dict] = []
     for window in windows:
@@ -966,10 +1356,21 @@ def suppress_windows_in_door_arc_regions(
         else:
             suppressed.append({
                 "window": asdict(window),
-                "door_arc_bbox": matched,
-                "reason": "门弧候选区域优先，不允许同位置生成窗",
+                "door_bbox": matched,
+                "reason": "已完成门图元/门候选优先，不允许同位置生成窗",
             })
     return kept, suppressed
+
+
+def preserved_layer_handles(msp, layers: set[str]) -> dict[str, list[str]]:
+    return {
+        layer: sorted(
+            entity.dxf.handle
+            for entity in msp
+            if entity.dxf.layer == layer and entity.dxf.handle is not None
+        )
+        for layer in sorted(layers)
+    }
 
 
 def generate(
@@ -981,31 +1382,73 @@ def generate(
     overall_height_mm: float,
     image_wall_bbox: tuple[int, int, int, int] | None = None,
     preprocessing_result: Path | None = None,
+    multimodal_result: Path | None = None,
 ) -> dict:
     if not wall_dxf.exists():
         raise FileNotFoundError(f"墙体 DXF 不存在：{wall_dxf}")
     gray = read_gray(source)
     wall_widths = load_wall_widths(data_path)
     plan_bbox = image_wall_bbox or detect_plan_bbox(gray)
-    pixel_windows, mask = detect_windows(
+    line_windows, line_mask = detect_windows(
         gray, plan_bbox, overall_width_mm, overall_height_mm, wall_widths
     )
-    preprocessing_fallback = False
-    if not pixel_windows:
-        pixel_windows = load_preprocessing_windows(preprocessing_result)
-        preprocessing_fallback = bool(pixel_windows)
-    pixel_windows, door_arc_suppressed = suppress_windows_in_door_arc_regions(
-        pixel_windows, preprocessing_result
-    )
-    stage_issues: list[str] = []
-    if not pixel_windows:
-        stage_issues.append("未找到满足窗户几何规则的候选；保留原墙体并继续流程")
 
     doc = ezdxf.readfile(wall_dxf)
     doc.units = ezdxf.units.MM
     if WINDOW_LAYER not in doc.layers:
         doc.layers.add(WINDOW_LAYER, color=4, linetype="CONTINUOUS")
     msp = doc.modelspace()
+    preserved_before = preserved_layer_handles(msp, {DOOR_LAYER, ROOM_NAME_LAYER})
+
+    resolved_multimodal = resolve_multimodal_result(multimodal_result, preprocessing_result)
+    outline, outline_mask, footprint_mask = load_outline_context(
+        resolved_multimodal, gray.shape
+    )
+    frozen_wall_mask, frozen_wall_mask_path, frozen_wall_mask_sha256 = load_frozen_wall_mask(
+        preprocessing_result, gray.shape
+    )
+    door_boxes = load_preprocessing_door_boxes(preprocessing_result)
+    dxf_door_boxes = load_dxf_door_boxes(
+        msp, plan_bbox, overall_width_mm, overall_height_mm
+    )
+    door_boxes.extend(dxf_door_boxes)
+
+    outline_gap_diagnostics: list[dict] = []
+    outline_rejected_line_candidates: list[dict] = []
+    outline_windows: list[PixelWindow] = []
+    if outline is not None and frozen_wall_mask is not None:
+        outline_windows, mask, outline_gap_diagnostics = detect_outline_gap_windows(
+            gray,
+            frozen_wall_mask,
+            footprint_mask,
+            outline,
+            door_boxes,
+            plan_bbox,
+            overall_width_mm,
+            overall_height_mm,
+            wall_widths,
+        )
+        pixel_windows, outline_rejected_line_candidates = merge_outline_and_line_evidence(
+            outline_windows, line_windows
+        )
+    else:
+        pixel_windows = list(line_windows)
+        mask = line_mask
+    preprocessing_fallback = False
+    if not pixel_windows:
+        pixel_windows = load_preprocessing_windows(preprocessing_result)
+        preprocessing_fallback = bool(pixel_windows)
+    pixel_windows, door_arc_suppressed = suppress_windows_in_door_arc_regions(
+        pixel_windows, door_boxes
+    )
+    stage_issues: list[str] = []
+    if outline is None:
+        stage_issues.append("缺少闭合 building_outline；本次仅执行旧四线窗兼容检测")
+    if frozen_wall_mask is None:
+        stage_issues.append("缺少冻结的 masks/walls.png；无法执行外轮廓减墙体检测")
+    if not pixel_windows:
+        stage_issues.append("外轮廓扣除墙体和门后未形成连续窗缺口；保留输入 DXF")
+
     converted_polylines = explode_wall_polylines(msp)
 
     accepted: list[CadWindow] = []
@@ -1077,6 +1520,17 @@ def generate(
     if final_wall_overlaps:
         stage_issues.append(f"闭合墙体重建后，窗洞范围内仍有 {final_wall_overlaps} 条墙体边界")
 
+    preserved_after = preserved_layer_handles(msp, {DOOR_LAYER, ROOM_NAME_LAYER})
+    preserved_ok = preserved_before == preserved_after
+    if not preserved_ok:
+        raise RuntimeError("窗阶段改变了输入中的 DOORS 或 ROOM_NAMES 实体，已停止保存")
+    frozen_wall_mask_unchanged = (
+        frozen_wall_mask_path is None
+        or frozen_wall_mask_sha256 == file_sha256(frozen_wall_mask_path)
+    )
+    if not frozen_wall_mask_unchanged:
+        raise RuntimeError("窗阶段改变了冻结的 masks/walls.png，已停止保存")
+
     output.parent.mkdir(parents=True, exist_ok=True)
     doc.saveas(output)
     auditor = doc.audit()
@@ -1090,12 +1544,37 @@ def generate(
         "overall_height_mm": overall_height_mm,
         "image_wall_bbox": {"x1": plan_bbox[0], "y1": plan_bbox[1], "x2": plan_bbox[2], "y2": plan_bbox[3]},
         "wall_width_candidates_mm": wall_widths,
-        "detector": "two-window-inner-lines-with-two-wall-faces-and-endcaps",
+        "detector": "building-outline-minus-walls-minus-doors-with-line-confirmation",
+        "processing_order": ["building_outline", "wall", "door", "window"],
+        "multimodal_result": str(resolved_multimodal.resolve()) if resolved_multimodal else None,
+        "building_outline": {
+            "id": outline.get("id"),
+            "closed": outline.get("closed"),
+            "confidence": outline.get("confidence"),
+            "polygon_point_count": len(outline.get("polygon_px", [])),
+        } if outline else None,
+        "outline_gap_rule": "building_outline - frozen_wall_mask - completed_doors",
+        "outline_gap_candidates": len(outline_windows),
+        "outline_gap_diagnostics": outline_gap_diagnostics,
+        "four_line_candidates": len(line_windows),
+        "four_line_candidates_outside_outline_gaps": outline_rejected_line_candidates,
+        "frozen_wall_mask": str(frozen_wall_mask_path.resolve()) if frozen_wall_mask_path and frozen_wall_mask_path.exists() else None,
+        "frozen_wall_mask_sha256": frozen_wall_mask_sha256,
+        "frozen_wall_mask_unchanged": frozen_wall_mask_unchanged,
         "preprocessing_evidence": load_preprocessing_evidence(preprocessing_result),
         "pixel_candidates": len(pixel_windows),
         "preprocessing_candidate_fallback": preprocessing_fallback,
         "door_arc_suppressed_windows": door_arc_suppressed,
         "door_arc_suppressed_window_count": len(door_arc_suppressed),
+        "door_exclusion_boxes": {
+            "preprocessing": len(door_boxes) - len(dxf_door_boxes),
+            "dxf_entities": len(dxf_door_boxes),
+        },
+        "preserved_layers": {
+            "before": {layer: len(handles) for layer, handles in preserved_before.items()},
+            "after": {layer: len(handles) for layer, handles in preserved_after.items()},
+            "handles_unchanged": preserved_ok,
+        },
         "accepted_windows": len(accepted),
         "accepted_image_only_windows": sum(
             1 for item in records if item.get("status") == "ACCEPTED_IMAGE_ONLY"
@@ -1127,17 +1606,19 @@ def generate(
     output.with_suffix(".json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    write_detection_artifacts(source, gray, mask, plan_bbox, pixel_windows, output)
+    write_detection_artifacts(
+        source, gray, mask, plan_bbox, pixel_windows, output, outline_mask=outline_mask
+    )
     draw_preview(doc, output.with_suffix(".png"), overall_width_mm, overall_height_mm)
     return report
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="在已校准墙体 DXF 上识别窗户、切出真实窗洞并生成窗框"
+        description="从建筑外轮廓扣除已完成墙体和门，识别剩余窗缺口并生成窗框"
     )
     parser.add_argument("source", type=Path, help="包含窗户的户型图片")
-    parser.add_argument("wall_dxf", type=Path, help="前一阶段生成并校验通过的墙体 DXF")
+    parser.add_argument("wall_dxf", type=Path, help="前一阶段生成并校验通过的墙体+门 DXF")
     parser.add_argument("output", type=Path, help="带窗户的输出 DXF")
     parser.add_argument(
         "--data",
@@ -1159,6 +1640,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="processing.py 生成的 result.json，用于在报告中保留预处理证据",
     )
+    parser.add_argument(
+        "--multimodal-result",
+        type=Path,
+        help="multimodal_fusion.py 生成的 multimodal.json；省略时从 result.json 同目录自动读取",
+    )
     return parser
 
 
@@ -1173,6 +1659,7 @@ def main() -> int:
         overall_height_mm=args.overall_height_mm,
         image_wall_bbox=tuple(args.image_wall_bbox) if args.image_wall_bbox else None,
         preprocessing_result=args.preprocessing_result,
+        multimodal_result=args.multimodal_result,
     )
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0
