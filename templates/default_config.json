@@ -30,6 +30,7 @@
   "door_width": 900,
   "bathroom_door_width": 700,
   "window_width": 1200,
-  "output_filename": "户型图",
-  "output_dir": "C:\\Users\\Administrator\\Desktop"
+
+  "output_filename": "户型图生成参考cad图纸",
+  "output_dir": "D:\\中建科技\\009_自动化软件平台\\floor-plan-generator\\templates"
 }
