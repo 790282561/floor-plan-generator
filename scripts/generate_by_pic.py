@@ -301,6 +301,19 @@ def matching_dimension_band(
     return min(matches, key=lambda band: abs(actual_center - (band[0] + band[1]) / 2.0))
 
 
+def contiguous_true_ranges(values: np.ndarray) -> list[tuple[int, int]]:
+    """Return half-open ranges for True runs in a one-dimensional mask."""
+    ranges: list[tuple[int, int]] = []
+    start: int | None = None
+    for index, value in enumerate(values.tolist() + [False]):
+        if value and start is None:
+            start = index
+        elif not value and start is not None:
+            ranges.append((start, index))
+            start = None
+    return ranges
+
+
 def extract_standard_wall_rectangles(
     roi: np.ndarray, estimated_thickness: float
 ) -> tuple[list[tuple[float, float, float, float]], list[dict]]:
@@ -322,11 +335,40 @@ def extract_standard_wall_rectangles(
     )
     for orientation, kernel in orientations:
         opened = cv2.morphologyEx(roi, cv2.MORPH_OPEN, kernel)
-        count, _, stats, _ = cv2.connectedComponentsWithStats(opened, 8)
-        for index in range(1, count):
-            x, y, width, height, area = (int(value) for value in stats[index])
+        candidates: list[tuple[int, int, int, int, int]] = []
+        if orientation == "horizontal":
+            # Split by row support first. A vertical wall connected at a T/L
+            # junction has insufficient horizontal support outside the actual
+            # horizontal strip and therefore cannot inflate the strip bbox.
+            cross_ranges = contiguous_true_ranges(
+                np.count_nonzero(opened, axis=1) >= kernel_length
+            )
+            for y_start, y_end in cross_ranges:
+                along = np.any(opened[y_start:y_end, :] > 0, axis=0)
+                for x_start, x_end in contiguous_true_ranges(along):
+                    if x_end - x_start < kernel_length:
+                        continue
+                    area = int(np.count_nonzero(opened[y_start:y_end, x_start:x_end]))
+                    candidates.append(
+                        (x_start, y_start, x_end - x_start, y_end - y_start, area)
+                    )
+        else:
+            cross_ranges = contiguous_true_ranges(
+                np.count_nonzero(opened, axis=0) >= kernel_length
+            )
+            for x_start, x_end in cross_ranges:
+                along = np.any(opened[:, x_start:x_end] > 0, axis=1)
+                for y_start, y_end in contiguous_true_ranges(along):
+                    if y_end - y_start < kernel_length:
+                        continue
+                    area = int(np.count_nonzero(opened[y_start:y_end, x_start:x_end]))
+                    candidates.append(
+                        (x_start, y_start, x_end - x_start, y_end - y_start, area)
+                    )
+
+        for x, y, width, height, area in candidates:
             if orientation == "horizontal":
-                if width < kernel_length or height > estimated_thickness * 2.0:
+                if width < kernel_length:
                     continue
                 cad_x1, cad_y_high = to_cad((WALL_BBOX_PX[0] + x, WALL_BBOX_PX[1] + y))
                 cad_x2, cad_y_low = to_cad(
@@ -355,7 +397,7 @@ def extract_standard_wall_rectangles(
                     role, source = "interior", "INTERIOR_RULE"
                 rectangle = (min(cad_x1, cad_x2), low, max(cad_x1, cad_x2), high)
             else:
-                if height < kernel_length or width > estimated_thickness * 2.0:
+                if height < kernel_length:
                     continue
                 cad_x_low, cad_y1 = to_cad((WALL_BBOX_PX[0] + x, WALL_BBOX_PX[1] + y))
                 cad_x_high, cad_y2 = to_cad(
@@ -610,6 +652,7 @@ def extract_wall_geometry(
             {item["assigned_width_mm"] for item in assignments}
         ),
         "wall_strip_rectangle_count": len(rectangles),
+        "strip_extraction_policy": "axis-projection-runs-preserve-connected-cross-walls",
         "polyline_coordinate_space": "cad_mm",
         "wall_bbox_px": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
     }
@@ -719,6 +762,72 @@ def write_preview(
     image.save(path)
 
 
+def validate_generated_walls_against_mask(
+    wall_evidence: np.ndarray,
+    polylines: list[list[tuple[float, float]]],
+) -> tuple[dict, np.ndarray]:
+    """Compare generated orthogonal wall topology with the frozen wall mask."""
+    source = wall_evidence < 127
+    generated = np.zeros_like(wall_evidence, dtype=np.uint8)
+    x1, y1, x2, y2 = WALL_BBOX_PX
+
+    def to_pixel(point: tuple[float, float]) -> tuple[int, int]:
+        x, y = point
+        px = x1 + x * (x2 - x1) / OVERALL_WIDTH_MM
+        py = y2 - y * (y2 - y1) / OVERALL_HEIGHT_MM
+        return int(round(px)), int(round(py))
+
+    horizontal_px = min(WALL_WIDTHS_MM) * (y2 - y1) / OVERALL_HEIGHT_MM
+    vertical_px = min(WALL_WIDTHS_MM) * (x2 - x1) / OVERALL_WIDTH_MM
+    line_thickness = max(2, int(round((horizontal_px + vertical_px) / 2.0)))
+    for polyline in polylines:
+        points = np.asarray([to_pixel(point) for point in polyline], dtype=np.int32)
+        if len(points) >= 2:
+            cv2.polylines(
+                generated,
+                [points.reshape((-1, 1, 2))],
+                True,
+                255,
+                line_thickness,
+            )
+
+    crop = np.zeros_like(source, dtype=bool)
+    crop[max(0, y1):min(source.shape[0], y2 + 1), max(0, x1):min(source.shape[1], x2 + 1)] = True
+    source &= crop
+    result = (generated > 0) & crop
+    max_wall_px = max(
+        max(WALL_WIDTHS_MM) * (y2 - y1) / OVERALL_HEIGHT_MM,
+        max(WALL_WIDTHS_MM) * (x2 - x1) / OVERALL_WIDTH_MM,
+    )
+    tolerance_px = max(2, int(round(max_wall_px * 0.60)))
+    kernel = np.ones((tolerance_px * 2 + 1, tolerance_px * 2 + 1), np.uint8)
+    source_buffer = cv2.dilate(np.uint8(source) * 255, kernel) > 0
+    result_buffer = cv2.dilate(np.uint8(result) * 255, kernel) > 0
+    source_pixels = int(source.sum())
+    result_pixels = int(result.sum())
+    intersection = int((source & result).sum())
+    union = int((source | result).sum())
+    recall = float((source & result_buffer).sum() / source_pixels) if source_pixels else 0.0
+    precision = float((result & source_buffer).sum() / result_pixels) if result_pixels else 0.0
+    consistent = source_pixels > 0 and result_pixels > 0 and recall >= 0.90 and precision >= 0.70
+    overlay = np.zeros((*source.shape, 3), dtype=np.uint8)
+    overlay[source] = (0, 0, 255)
+    overlay[result] = (0, 255, 0)
+    overlay[source & result] = (0, 255, 255)
+    return {
+        "status": "passed" if consistent else "severe_mismatch",
+        "consistent": consistent,
+        "tolerance_px": tolerance_px,
+        "mask_wall_pixels": source_pixels,
+        "cad_wall_pixels": result_pixels,
+        "raw_iou": round(intersection / union, 4) if union else 0.0,
+        "buffered_mask_recall": round(recall, 4),
+        "buffered_cad_precision": round(precision, 4),
+        "minimum_mask_recall": 0.90,
+        "minimum_cad_precision": 0.70,
+    }, overlay
+
+
 def generate(
     source: Path,
     output: Path,
@@ -790,6 +899,10 @@ def generate(
         and closed_wall_polylines > 0
         and len(auditor.errors) == 0
     )
+    wall_mask_fidelity, wall_mask_overlay = validate_generated_walls_against_mask(
+        wall_evidence, cad_polylines
+    )
+    wall_geometry_valid = wall_geometry_valid and wall_mask_fidelity["consistent"]
     if not wall_geometry_valid:
         stage_issues.append({
             "stage": "walls",
@@ -800,8 +913,21 @@ def generate(
             "audit_errors": len(auditor.errors),
             "suggested_repair": "检查预处理墙体 mask 与连续轮廓提取结果",
         })
+    if not wall_mask_fidelity["consistent"]:
+        stage_issues.append({
+            "stage": "walls",
+            "issue": "generated_wall_mask_severe_mismatch",
+            **wall_mask_fidelity,
+            "suggested_repair": "检查墙条投影提取是否遗漏与交叉墙相连的水平或竖向墙段",
+        })
 
     output.parent.mkdir(parents=True, exist_ok=True)
+    wall_mask_validation_path = output.with_name(
+        output.stem + "_wall_mask_validation.png"
+    )
+    cv2.imencode(".png", wall_mask_overlay)[1].tofile(
+        str(wall_mask_validation_path)
+    )
     doc.saveas(output)
     report = {
         "source": str(source.resolve()),
@@ -816,7 +942,9 @@ def generate(
         "wall_boundary_edges": sum(len(item) for item in polylines),
         "wall_topology": "orthogonal-standard-width-editable-lwpolylines",
         "wall_geometry_valid": wall_geometry_valid,
-        "ready_for_openings": True,
+        "wall_mask_fidelity": wall_mask_fidelity,
+        "wall_mask_validation_image": str(wall_mask_validation_path.resolve()),
+        "ready_for_openings": wall_geometry_valid,
         "audit_errors": len(auditor.errors),
         "audit_fixes": len(auditor.fixes),
         "stage_status": "needs_repair" if stage_issues else "ready",

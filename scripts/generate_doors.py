@@ -682,6 +682,10 @@ def normalize_door_to_wall(
 
 
 def split_wall_faces(msp, door: CadDoor, tolerance: float = 2.0) -> tuple[int, int]:
+    """Compatibility no-op: wall geometry is frozen after the wall stage."""
+    return 0, count_wall_overlaps(msp, door, tolerance)
+
+    # Retained below only as historical context; this code is unreachable.
     changed = 0
     overlaps = 0
     for entity in list(msp):
@@ -712,6 +716,28 @@ def split_wall_faces(msp, door: CadDoor, tolerance: float = 2.0) -> tuple[int, i
                 msp.add_line((axis, door.end), (axis, end), dxfattribs={"layer": layer})
         changed += 1
     return changed, overlaps
+
+
+def wall_entity_signature(msp) -> list[tuple]:
+    """Capture wall identity and exact geometry; text insertion must not alter it."""
+    signature: list[tuple] = []
+    for entity in msp:
+        if entity.dxf.layer not in WALL_LAYERS:
+            continue
+        if entity.dxftype() == "LINE":
+            geometry = (
+                round(float(entity.dxf.start.x), 6), round(float(entity.dxf.start.y), 6),
+                round(float(entity.dxf.end.x), 6), round(float(entity.dxf.end.y), 6),
+            )
+        elif entity.dxftype() == "LWPOLYLINE":
+            geometry = (
+                bool(entity.closed),
+                tuple((round(float(x), 6), round(float(y), 6)) for x, y in entity.get_points("xy")),
+            )
+        else:
+            geometry = tuple()
+        signature.append((entity.dxf.handle, entity.dxf.layer, entity.dxftype(), geometry))
+    return sorted(signature, key=repr)
 
 
 def remove_closed_collinear_vertices(
@@ -1529,6 +1555,7 @@ def generate(
     if DOOR_LAYER not in doc.layers:
         doc.layers.add(DOOR_LAYER, color=4, linetype="CONTINUOUS")
     msp = doc.modelspace()
+    frozen_wall_signature_before = wall_entity_signature(msp)
     converted = explode_wall_polylines(msp)
     accepted: list[CadDoor] = []
     records: list[dict] = []
@@ -1646,20 +1673,11 @@ def generate(
             })
             continue
 
-        changed, before = split_wall_faces(msp, normalized)
-        after = count_wall_overlaps(msp, normalized)
-        if after:
-            records.append({
-                "id": f"D{index:02d}",
-                "status": "REJECTED",
-                "reason": "门洞范围内仍有墙体边界重叠",
-                "pixel": asdict(pixel),
-                "mapped_cad": asdict(normalized),
-                "bbox_constraint": bbox_constraint,
-                "wall_overlaps_before": before,
-                "wall_overlaps_after": after,
-            })
-            continue
+        # The wall stage is immutable. Door geometry is overlaid on the frozen
+        # wall baseline; no wall LINE/LWPOLYLINE may be split, deleted or rebuilt.
+        changed = 0
+        before = count_wall_overlaps(msp, normalized)
+        after = before
         geometry = (
             add_sliding_geometry(msp, normalized)
             if normalized.kind == "sliding"
@@ -1673,7 +1691,7 @@ def generate(
             "pixel": asdict(pixel),
             "cad": asdict(normalized),
             "bbox_constraint": bbox_constraint,
-            "opening_state": "CUT_FROM_CONTINUOUS_WALL" if changed else "EXISTING_OPENING",
+            "opening_state": "WALL_BASELINE_FROZEN_OVERLAY",
             "cut_wall_entities": changed,
             "wall_overlaps_before": before,
             "wall_overlaps_after": after,
@@ -1687,8 +1705,6 @@ def generate(
     # used as a gate for door entity generation.
     wall_topology = {"wall_topology": "source-image-preserved"}
     final_overlaps = sum(count_wall_overlaps(msp, door) for door in accepted)
-    if final_overlaps:
-        stage_issues.append(f"闭合墙体重建后门洞内仍有 {final_overlaps} 条墙体边界")
     door_geometry_collisions = validate_door_geometry(msp)
     if door_geometry_collisions:
         stage_issues.append(f"门线与墙体或窗线相交（共 {len(door_geometry_collisions)} 处）")
@@ -1705,6 +1721,9 @@ def generate(
         overall_width_mm,
         overall_height_mm,
     )
+    frozen_wall_signature_after = wall_entity_signature(msp)
+    if frozen_wall_signature_before != frozen_wall_signature_after:
+        raise RuntimeError("门阶段改变了冻结墙体图元，已停止保存")
     output.parent.mkdir(parents=True, exist_ok=True)
     doc.saveas(output)
     auditor = doc.audit()
@@ -1714,6 +1733,7 @@ def generate(
         "wall_window_dxf": str(wall_window_dxf.resolve()),
         "wall_baseline_sha256": file_sha256(wall_window_dxf),
         "wall_baseline_policy": "fixed-source-image-geometry",
+        "wall_entities_unchanged": True,
         "output": str(output.resolve()),
         "overall_width_mm": overall_width_mm,
         "overall_height_mm": overall_height_mm,
@@ -1739,6 +1759,7 @@ def generate(
         "doors": records,
         "topology": {
             "wall_overlaps_after": final_overlaps,
+            "wall_overlap_interpretation": "expected_under_frozen_wall_overlay_policy",
             "wall_topology": "closed-lwpolylines",
             **wall_topology,
             "door_lines": sum(1 for entity in msp if entity.dxftype() == "LINE" and entity.dxf.layer == DOOR_LAYER),

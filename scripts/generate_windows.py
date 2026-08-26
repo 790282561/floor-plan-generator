@@ -1000,6 +1000,10 @@ def normalize_window_to_wall(
 def split_wall_faces(msp, window: CadWindow, tolerance: float = 2.0) -> tuple[int, int]:
     """切除窗洞内连续墙面线；返回改动实体数和实际重叠数。"""
 
+    # Compatibility no-op. The wall baseline is immutable after generation.
+    return 0, count_wall_overlaps(msp, window, tolerance)
+
+    # Retained below only as historical context; this code is unreachable.
     changed = 0
     overlaps = 0
     for entity in list(msp):
@@ -1504,6 +1508,114 @@ def preserved_layer_handles(msp, layers: set[str]) -> dict[str, list[str]]:
     }
 
 
+def wall_entity_signature(msp) -> list[tuple]:
+    """Capture exact frozen wall geometry, not only entity counts or handles."""
+    signature: list[tuple] = []
+    for entity in msp:
+        if entity.dxf.layer not in WALL_LAYERS:
+            continue
+        if entity.dxftype() == "LINE":
+            geometry = (
+                round(float(entity.dxf.start.x), 6), round(float(entity.dxf.start.y), 6),
+                round(float(entity.dxf.end.x), 6), round(float(entity.dxf.end.y), 6),
+            )
+        elif entity.dxftype() == "LWPOLYLINE":
+            geometry = (
+                bool(entity.closed),
+                tuple((round(float(x), 6), round(float(y), 6)) for x, y in entity.get_points("xy")),
+            )
+        else:
+            geometry = tuple()
+        signature.append((entity.dxf.handle, entity.dxf.layer, entity.dxftype(), geometry))
+    return sorted(signature, key=repr)
+
+
+def validate_wall_mask_fidelity(
+    msp,
+    frozen_wall_mask: np.ndarray,
+    plan_bbox: tuple[int, int, int, int],
+    overall_width_mm: float,
+    overall_height_mm: float,
+    wall_widths_mm: Sequence[float],
+) -> tuple[dict, np.ndarray]:
+    """Rasterize final CAD walls and detect severe loss against the frozen mask."""
+    generated = np.zeros_like(frozen_wall_mask, dtype=np.uint8)
+    x1, y1, x2, y2 = plan_bbox
+
+    def pixel(point: tuple[float, float]) -> tuple[int, int]:
+        x, y = point
+        px = x1 + x * (x2 - x1) / overall_width_mm
+        py = y2 - y * (y2 - y1) / overall_height_mm
+        return int(round(px)), int(round(py))
+
+    horizontal_px = max(wall_widths_mm) * (y2 - y1) / overall_height_mm
+    vertical_px = max(wall_widths_mm) * (x2 - x1) / overall_width_mm
+    horizontal_line_px = min(wall_widths_mm) * (y2 - y1) / overall_height_mm
+    vertical_line_px = min(wall_widths_mm) * (x2 - x1) / overall_width_mm
+    polyline_thickness = max(2, int(round((horizontal_line_px + vertical_line_px) / 2.0)))
+    for entity in msp:
+        if entity.dxf.layer not in WALL_LAYERS:
+            continue
+        if entity.dxftype() == "LWPOLYLINE":
+            points = np.asarray(
+                [pixel((float(x), float(y))) for x, y in entity.get_points("xy")],
+                dtype=np.int32,
+            )
+            if len(points) < 2:
+                continue
+            # A closed wall polyline can surround the whole wall network; filling
+            # it would incorrectly classify room interiors as wall. Render its
+            # boundary with a standard wall thickness to compare topology.
+            cv2.polylines(
+                generated,
+                [points.reshape((-1, 1, 2))],
+                bool(entity.closed),
+                255,
+                polyline_thickness,
+            )
+        elif entity.dxftype() == "LINE":
+            start = (float(entity.dxf.start.x), float(entity.dxf.start.y))
+            end = (float(entity.dxf.end.x), float(entity.dxf.end.y))
+            thickness = horizontal_line_px if abs(start[1] - end[1]) <= abs(start[0] - end[0]) else vertical_line_px
+            cv2.line(generated, pixel(start), pixel(end), 255, max(1, int(round(thickness))))
+
+    source = frozen_wall_mask > 0
+    result = generated > 0
+    crop = np.zeros_like(source, dtype=bool)
+    crop[max(0, y1):min(source.shape[0], y2 + 1), max(0, x1):min(source.shape[1], x2 + 1)] = True
+    source &= crop
+    result &= crop
+    # Half a configured wall thickness absorbs the permitted width
+    # normalization while still exposing missing or displaced wall runs.
+    tolerance_px = max(2, int(round(max(horizontal_px, vertical_px) * 0.60)))
+    kernel = np.ones((tolerance_px * 2 + 1, tolerance_px * 2 + 1), np.uint8)
+    source_buffer = cv2.dilate(np.uint8(source) * 255, kernel) > 0
+    result_buffer = cv2.dilate(np.uint8(result) * 255, kernel) > 0
+    source_pixels = int(source.sum())
+    result_pixels = int(result.sum())
+    intersection = int((source & result).sum())
+    union = int((source | result).sum())
+    recall = float((source & result_buffer).sum() / source_pixels) if source_pixels else 0.0
+    precision = float((result & source_buffer).sum() / result_pixels) if result_pixels else 0.0
+    consistent = source_pixels > 0 and result_pixels > 0 and recall >= 0.90 and precision >= 0.70
+    overlay = np.zeros((*source.shape, 3), dtype=np.uint8)
+    overlay[source] = (0, 0, 255)
+    overlay[result] = (0, 255, 0)
+    overlay[source & result] = (0, 255, 255)
+    return {
+        "status": "passed" if consistent else "severe_mismatch",
+        "consistent": consistent,
+        "tolerance_px": tolerance_px,
+        "mask_wall_pixels": source_pixels,
+        "cad_wall_pixels": result_pixels,
+        "raw_iou": round(intersection / union, 4) if union else 0.0,
+        "buffered_mask_recall": round(recall, 4),
+        "buffered_cad_precision": round(precision, 4),
+        "minimum_mask_recall": 0.90,
+        "minimum_cad_precision": 0.70,
+    }, overlay
+
+
 def generate(
     source: Path,
     wall_dxf: Path,
@@ -1529,7 +1641,10 @@ def generate(
     if WINDOW_LAYER not in doc.layers:
         doc.layers.add(WINDOW_LAYER, color=4, linetype="CONTINUOUS")
     msp = doc.modelspace()
-    preserved_before = preserved_layer_handles(msp, {DOOR_LAYER, ROOM_NAME_LAYER})
+    frozen_wall_signature_before = wall_entity_signature(msp)
+    preserved_before = preserved_layer_handles(
+        msp, {DOOR_LAYER, ROOM_NAME_LAYER, *WALL_LAYERS}
+    )
 
     resolved_multimodal = resolve_multimodal_result(multimodal_result, preprocessing_result)
     outline, outline_mask, footprint_mask = load_outline_context(
@@ -1619,17 +1734,19 @@ def generate(
                 }
             )
             continue
-        changed, previous_overlaps = split_wall_faces(msp, normalized)
-        remaining_overlaps = count_wall_overlaps(msp, normalized)
-        status = "ACCEPTED" if remaining_overlaps == 0 else "REJECTED"
+        # Windows inherit the frozen wall geometry but never cut or rebuild it.
+        changed = 0
+        previous_overlaps = count_wall_overlaps(msp, normalized)
+        remaining_overlaps = previous_overlaps
+        status = "ACCEPTED"
         records.append(
             {
                 "id": f"W{index:02d}",
                 "status": status,
-                "reason": None if status == "ACCEPTED" else "窗洞范围内仍有墙线重叠",
+                "reason": None,
                 "pixel": asdict(pixel),
                 "cad": asdict(normalized),
-                "opening_state": "CUT_FROM_CONTINUOUS_WALL" if changed else "EXISTING_OPENING",
+                "opening_state": "WALL_BASELINE_FROZEN_OVERLAY",
                 "cut_wall_entities": changed,
                 "wall_overlaps_before": previous_overlaps,
                 "wall_overlaps_after": remaining_overlaps,
@@ -1649,13 +1766,13 @@ def generate(
     # used as a gate for window entity generation.
     wall_topology = {"wall_topology": "source-image-preserved"}
     final_wall_overlaps = sum(count_wall_overlaps(msp, item) for item in accepted)
-    if final_wall_overlaps:
-        stage_issues.append(f"闭合墙体重建后，窗洞范围内仍有 {final_wall_overlaps} 条墙体边界")
 
-    preserved_after = preserved_layer_handles(msp, {DOOR_LAYER, ROOM_NAME_LAYER})
+    preserved_after = preserved_layer_handles(
+        msp, {DOOR_LAYER, ROOM_NAME_LAYER, *WALL_LAYERS}
+    )
     preserved_ok = preserved_before == preserved_after
     if not preserved_ok:
-        raise RuntimeError("窗阶段改变了输入中的 DOORS 或 ROOM_NAMES 实体，已停止保存")
+        raise RuntimeError("窗阶段改变了输入中的墙体、DOORS 或 ROOM_NAMES 实体，已停止保存")
     frozen_wall_mask_unchanged = (
         frozen_wall_mask_path is None
         or frozen_wall_mask_sha256 == file_sha256(frozen_wall_mask_path)
@@ -1663,7 +1780,35 @@ def generate(
     if not frozen_wall_mask_unchanged:
         raise RuntimeError("窗阶段改变了冻结的 masks/walls.png，已停止保存")
 
+    frozen_wall_signature_after = wall_entity_signature(msp)
+    wall_geometry_unchanged = frozen_wall_signature_before == frozen_wall_signature_after
+    if not wall_geometry_unchanged:
+        raise RuntimeError("窗阶段改变了冻结墙体的坐标或图元，已停止保存")
+
+    wall_mask_fidelity: dict = {
+        "status": "unavailable",
+        "consistent": False,
+        "reason": "缺少冻结的 masks/walls.png",
+    }
+    wall_mask_overlay = None
+    if frozen_wall_mask is not None:
+        wall_mask_fidelity, wall_mask_overlay = validate_wall_mask_fidelity(
+            msp,
+            frozen_wall_mask,
+            plan_bbox,
+            overall_width_mm,
+            overall_height_mm,
+            wall_widths,
+        )
+        if not wall_mask_fidelity["consistent"]:
+            stage_issues.append(
+                "最终墙体与冻结 wall mask 严重不一致，可能存在墙体丢失或轮廓偏移"
+            )
+
     output.parent.mkdir(parents=True, exist_ok=True)
+    wall_mask_overlay_path = output.with_name(output.stem + "_wall_mask_validation.png")
+    if wall_mask_overlay is not None:
+        cv2.imencode(".png", wall_mask_overlay)[1].tofile(str(wall_mask_overlay_path))
     doc.saveas(output)
     auditor = doc.audit()
     report = {
@@ -1671,6 +1816,9 @@ def generate(
         "wall_dxf": str(wall_dxf.resolve()),
         "wall_baseline_sha256": file_sha256(wall_dxf),
         "wall_baseline_policy": "fixed-source-image-geometry",
+        "wall_entities_unchanged": wall_geometry_unchanged,
+        "wall_mask_fidelity": wall_mask_fidelity,
+        "wall_mask_validation_image": str(wall_mask_overlay_path.resolve()) if wall_mask_overlay is not None else None,
         "output": str(output.resolve()),
         "overall_width_mm": overall_width_mm,
         "overall_height_mm": overall_height_mm,
@@ -1720,6 +1868,7 @@ def generate(
         "windows": records,
         "topology": {
             "wall_overlaps_after": final_wall_overlaps,
+            "wall_overlap_interpretation": "expected_under_frozen_wall_overlay_policy",
             "wall_topology": "closed-lwpolylines",
             **wall_topology,
             "closed_window_frames": sum(
@@ -1740,6 +1889,7 @@ def generate(
         "audit_errors": len(auditor.errors),
         "audit_fixes": len(auditor.fixes),
         "target_cad_visual_check": False,
+        "final_output_qualified": not stage_issues and bool(wall_mask_fidelity.get("consistent")),
         "stage_status": "needs_repair" if stage_issues else "ready",
         "repair_queue": stage_issues,
     }
