@@ -7,6 +7,7 @@ import argparse
 import json
 import math
 from pathlib import Path
+from typing import Any
 
 import cv2
 import ezdxf
@@ -618,14 +619,15 @@ def extract_wall_geometry(
     list[tuple[int, int, int, int]], list[list[tuple[float, float]]], dict
 ]:
     # `gray` is the canonical binary wall mask rendered as black wall pixels
-    # on white. The mask remains the only geometry evidence; this stage turns
-    # its measured strips into straight, orthogonal wall rectangles with a
-    # thickness selected from data.json, then unions those rectangles.
+    # on white.  Rebuild the long wall runs as orthogonal standard-width
+    # rectangles; any short mask branch missed by the run extractor is added
+    # later with the same standard-width policy and unioned to its parent.
     mask = np.uint8(gray < 127) * 255
     x1, y1, x2, y2 = WALL_BBOX_PX
     roi = mask[y1 : y2 + 1, x1 : x2 + 1]
     if roi.size == 0 or not np.any(roi):
         raise ValueError("wall-bbox 中没有可用墙体 mask 像素")
+
     estimated_thickness = estimate_wall_thickness_px(roi)
     rectangles, assignments = extract_standard_wall_rectangles(
         roi, estimated_thickness
@@ -635,6 +637,7 @@ def extract_wall_geometry(
     polylines = rectangles_to_closed_polylines(rectangles)
     boundary_edges = sum(len(item) for item in polylines)
     return [], polylines, {
+        "_wall_rectangles_mm": rectangles,
         "horizontal_boundary_lines": 0,
         "vertical_boundary_lines": 0,
         "diagonal_boundary_lines": 0,
@@ -643,8 +646,6 @@ def extract_wall_geometry(
         "closed_wall_boundary_edges": boundary_edges,
         "extraction_mode": "mask-strips-to-standard-width-orthogonal-lwpolylines",
         "edge_pickup_policy": "wall-mask-only-orthogonal-strip-reconstruction",
-        "collinear_angle_tolerance_deg": COLLINEAR_ANGLE_TOLERANCE_DEG,
-        "contour_noise_tolerance_px": CONTOUR_NOISE_TOLERANCE_PX,
         "estimated_wall_thickness_px": round(estimated_thickness, 3),
         "wall_width_candidates_mm": WALL_WIDTHS_MM,
         "wall_width_assignments": assignments,
@@ -656,6 +657,70 @@ def extract_wall_geometry(
         "polyline_coordinate_space": "cad_mm",
         "wall_bbox_px": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
     }
+
+
+def mask_connected_fragment_rectangles(
+    candidates: list[dict[str, int | list[int]]],
+    base_rectangles: list[tuple[float, float, float, float]],
+) -> tuple[list[tuple[float, float, float, float]], list[dict[str, Any]]]:
+    """Normalize each omitted short mask branch and overlap it into its parent."""
+    rectangles: list[tuple[float, float, float, float]] = []
+    normalized: list[dict[str, Any]] = []
+    assigned_width = min(WALL_WIDTHS_MM)
+    for candidate in candidates:
+        x, y, width, height = (int(value) for value in candidate["bbox_px"])
+        if width < 1 or height < 1:
+            continue
+        horizontal = width >= height
+        overlap_px = max(1, min(width, height))
+        connected_to: int | None = None
+        if horizontal:
+            start = to_cad((x - overlap_px, y + height // 2))[0]
+            end = to_cad((x + width - 1 + overlap_px, y + height // 2))[0]
+            center = to_cad((x + width // 2, y + height // 2))[1]
+            options = [
+                (abs((ry1 + ry2) / 2 - center), index, (ry1 + ry2) / 2)
+                for index, (rx1, ry1, rx2, ry2) in enumerate(base_rectangles)
+                if max(min(start, end), rx1) <= min(max(start, end), rx2)
+            ]
+            if options:
+                distance, connected_to, parent_center = min(options)
+                if distance <= assigned_width * 2:
+                    center = parent_center
+                else:
+                    connected_to = None
+            rectangle = (min(start, end), center - assigned_width / 2,
+                         max(start, end), center + assigned_width / 2)
+            orientation = "horizontal"
+        else:
+            start = to_cad((x + width // 2, y - overlap_px))[1]
+            end = to_cad((x + width // 2, y + height - 1 + overlap_px))[1]
+            center = to_cad((x + width // 2, y + height // 2))[0]
+            options = [
+                (abs((rx1 + rx2) / 2 - center), index, (rx1 + rx2) / 2)
+                for index, (rx1, ry1, rx2, ry2) in enumerate(base_rectangles)
+                if max(min(start, end), ry1) <= min(max(start, end), ry2)
+            ]
+            if options:
+                distance, connected_to, parent_center = min(options)
+                if distance <= assigned_width * 2:
+                    center = parent_center
+                else:
+                    connected_to = None
+            rectangle = (center - assigned_width / 2, min(start, end),
+                         center + assigned_width / 2, max(start, end))
+            orientation = "vertical"
+        rectangle = tuple(round(value, 3) for value in rectangle)
+        rectangles.append(rectangle)
+        normalized.append({
+            **candidate,
+            "orientation": orientation,
+            "assigned_width_mm": assigned_width,
+            "mask_overlap_px": overlap_px,
+            "connected_to_base_rectangle": connected_to,
+            "rectangle_mm": rectangle,
+        })
+    return rectangles, normalized
 
 
 def to_cad(point: tuple[int, int]) -> tuple[float, float]:
@@ -790,8 +855,10 @@ def extract_source_only_wall_fragments(
 def validate_generated_walls_against_mask(
     wall_evidence: np.ndarray,
     polylines: list[list[tuple[float, float]]],
+    *,
+    fill_closed_polylines: bool = False,
 ) -> tuple[dict, np.ndarray]:
-    """Compare generated orthogonal wall topology with the frozen wall mask."""
+    """Compare generated wall topology with the frozen wall mask."""
     source = wall_evidence < 127
     generated = np.zeros_like(wall_evidence, dtype=np.uint8)
     x1, y1, x2, y2 = WALL_BBOX_PX
@@ -807,7 +874,12 @@ def validate_generated_walls_against_mask(
     line_thickness = max(2, int(round((horizontal_px + vertical_px) / 2.0)))
     for polyline in polylines:
         points = np.asarray([to_pixel(point) for point in polyline], dtype=np.int32)
-        if len(points) >= 2:
+        if fill_closed_polylines and len(points) >= 3:
+            # Direct mask contours represent wall areas, not merely centre
+            # lines.  Filling the exported closed loop preserves the exact
+            # white-mask footprint for validation.
+            cv2.fillPoly(generated, [points.reshape((-1, 1, 2))], 255)
+        elif len(points) >= 2:
             cv2.polylines(
                 generated,
                 [points.reshape((-1, 1, 2))],
@@ -853,6 +925,10 @@ def validate_generated_walls_against_mask(
         "buffered_cad_precision": round(precision, 4),
         "minimum_mask_recall": 0.90,
         "minimum_cad_precision": 0.70,
+        "render_mode": (
+            "filled_closed_mask_contours"
+            if fill_closed_polylines else "fixed-width-boundary-strokes"
+        ),
         "source_only_wall_components": source_only_components,
         "short_wall_fragment_candidates": short_wall_fragment_candidates,
     }, overlay
@@ -869,14 +945,32 @@ def generate(
         gray, wall_mask, wall_mask_weight
     )
     lines, polylines, stats = extract_wall_geometry(wall_evidence)
+    base_rectangles = stats.pop("_wall_rectangles_mm")
+    provisional_fidelity, _ = validate_generated_walls_against_mask(
+        wall_evidence, polylines
+    )
+    fragment_rectangles, merged_short_wall_fragments = (
+        mask_connected_fragment_rectangles(
+            provisional_fidelity["short_wall_fragment_candidates"], base_rectangles
+        )
+    )
+    if fragment_rectangles:
+        # The union is the only place where a fragment becomes wall geometry;
+        # do not write an independent candidate polyline.
+        polylines = rectangles_to_closed_polylines(
+            [*base_rectangles, *fragment_rectangles]
+        )
+        stats["closed_wall_polylines"] = len(polylines)
+        stats["closed_wall_boundary_edges"] = sum(len(item) for item in polylines)
     mask_stats.update({
         "postprocessing_applied_after_edge_pickup": True,
-        "postprocessing_kind": (
-            "wall-mask-orthogonal-strip-reconstruction-with-standard-width-assignment"
-        ),
+        "postprocessing_kind": "standard-width-mask-connected-fragment-union",
         "wall_mask_modified": False,
+        "local_mask_fragment_merge_applied": bool(fragment_rectangles),
+        "merged_short_wall_fragment_count": len(merged_short_wall_fragments),
+        "merged_short_wall_fragments": merged_short_wall_fragments,
     })
-    stage_issues: list[str] = []
+    stage_issues: list[Any] = []
     # Independent lines are valid source evidence in image-faithful mode.
     # No repair item is created for open walls: closure is deliberately not
     # checked or used as a stage gate.
@@ -932,6 +1026,8 @@ def generate(
     wall_mask_fidelity, wall_mask_overlay = validate_generated_walls_against_mask(
         wall_evidence, cad_polylines
     )
+    wall_mask_fidelity["merged_short_wall_fragments"] = merged_short_wall_fragments
+    wall_mask_fidelity["local_mask_fragment_merge_applied"] = bool(fragment_rectangles)
     wall_geometry_valid = wall_geometry_valid and wall_mask_fidelity["consistent"]
     if not wall_geometry_valid:
         stage_issues.append({
