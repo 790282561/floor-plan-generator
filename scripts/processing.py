@@ -186,9 +186,53 @@ def make_ink_mask(gray: np.ndarray) -> np.ndarray:
     return mask
 
 
+def select_wall_width_reduction(
+    ink: np.ndarray,
+    *,
+    minimum_px: int = 2,
+    maximum_px: int = 12,
+) -> tuple[int, dict[str, Any]]:
+    """Choose a total erosion width from the thick strokes in this image.
+
+    The input contains both wall ink and much thinner annotation ink.  The
+    local maxima of a distance transform occur near stroke centres, so their
+    upper-middle percentile is a useful per-image wall-width estimate without
+    requiring a fixed source DPI.  The chosen reduction is half that estimated
+    width: enough to remove thin strokes while retaining a wall core.
+    """
+    if minimum_px < 0 or maximum_px < minimum_px:
+        raise ValueError("invalid wall-width reduction limits")
+
+    distance = cv2.distanceTransform((ink > 0).astype(np.uint8), cv2.DIST_L2, 5)
+    if not np.any(distance > 0):
+        return 0, {
+            "mode": "auto",
+            "estimated_wall_stroke_width_px": 0.0,
+            "candidate_width_reduction_px": [0],
+            "selection_reason": "no foreground ink",
+        }
+
+    # Keep only ridge pixels.  Sampling every foreground pixel would heavily
+    # weight wide wall interiors instead of their actual stroke widths.
+    local_max = distance >= cv2.dilate(distance, np.ones((3, 3), np.float32))
+    ridge_radii = distance[(distance > 0) & local_max]
+    estimated_width = float(2.0 * np.percentile(ridge_radii, 75))
+    candidates = list(range(minimum_px, maximum_px + 1, 2))
+    if minimum_px == 0 and 0 not in candidates:
+        candidates.insert(0, 0)
+    selected = min(candidates, key=lambda value: abs(value - estimated_width / 2.0))
+    return int(selected), {
+        "mode": "auto",
+        "estimated_wall_stroke_width_px": round(estimated_width, 2),
+        "candidate_width_reduction_px": candidates,
+        "selection_reason": "nearest candidate to half estimated wall stroke width",
+    }
+
+
 def filter_wall_ink_by_width(
-    ink: np.ndarray, width_reduction_px: int = 10
-) -> tuple[np.ndarray, dict[str, int | float]]:
+    ink: np.ndarray,
+    width_reduction_px: int | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
     """Keep only strokes with a core after reducing total width by N pixels.
 
     An (N+1)x(N+1) erosion removes N pixels from the total stroke width
@@ -196,8 +240,19 @@ def filter_wall_ink_by_width(
     intersected with the original ink, so retained walls keep their original
     thickness while thin lines disappear.
     """
+    if width_reduction_px is None:
+        width_reduction_px, selection_report = select_wall_width_reduction(ink)
+    else:
+        selection_report = {
+            "mode": "manual",
+            "estimated_wall_stroke_width_px": None,
+            "candidate_width_reduction_px": [int(width_reduction_px)],
+            "selection_reason": "explicit user override",
+        }
+
     if width_reduction_px < 1:
         return ink.copy(), {
+            **selection_report,
             "width_reduction_px": 0,
             "input_ink_pixels": int(np.count_nonzero(ink)),
             "surviving_core_pixels": int(np.count_nonzero(ink)),
@@ -216,6 +271,7 @@ def filter_wall_ink_by_width(
         if not np.any(retained[labels == index]):
             eliminated += 1
     return retained, {
+        **selection_report,
         "width_reduction_px": width_reduction_px,
         "erosion_kernel_px": kernel_size,
         "input_ink_pixels": int(np.count_nonzero(ink)),
@@ -1472,6 +1528,7 @@ def process_floor_plan(
     ocr_lang: str = "chi_sim+eng",
     apply_deskew: bool = True,
     wall_calibration: dict[str, Any] | None = None,
+    wall_width_reduction_px: int | None = None,
 ) -> dict[str, Any]:
     image = read_image(input_path)
     normalized, skew_angle = deskew(image) if apply_deskew else (image.copy(), 0.0)
@@ -1479,7 +1536,7 @@ def process_floor_plan(
     ink = make_ink_mask(gray)
 
     wall_candidate_ink, wall_width_filter = filter_wall_ink_by_width(
-        ink, width_reduction_px=6
+        ink, width_reduction_px=wall_width_reduction_px
     )
     wall_candidate_ink, wall_width_filter = remove_isolated_wall_noise(
         wall_candidate_ink, wall_width_filter
@@ -1634,6 +1691,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-deskew", action="store_true", help="禁用自动倾斜校正"
     )
     parser.add_argument(
+        "--wall-width-reduction-px",
+        type=int,
+        help=(
+            "覆盖自动选择的墙体总侵蚀宽度（px）；省略时根据本图粗线宽度"
+            "自动从 2、4、6、8、10、12 中选择。"
+        ),
+    )
+    parser.add_argument(
         "--standard-answer-wall-calibration",
         action="store_true",
         help=(
@@ -1651,6 +1716,7 @@ def main() -> int:
         args.output_dir,
         ocr_lang="" if args.no_ocr else args.ocr_lang,
         apply_deskew=not args.no_deskew,
+        wall_width_reduction_px=args.wall_width_reduction_px,
         wall_calibration=(
             STANDARD_ANSWER_WALL_CALIBRATION
             if args.standard_answer_wall_calibration
