@@ -228,6 +228,226 @@ def filter_wall_ink_by_width(
     }
 
 
+def remove_isolated_wall_noise(
+    retained: np.ndarray, filter_report: dict[str, Any]
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Drop thick symbols that survived erosion but are isolated from walls."""
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(retained, 8)
+    if count <= 1:
+        filter_report["removed_isolated_wall_noise_pixels"] = 0
+        filter_report["removed_isolated_wall_noise_components"] = []
+        return retained, filter_report
+
+    large = np.zeros_like(retained)
+    for index in range(1, count):
+        area = int(stats[index, cv2.CC_STAT_AREA])
+        if area >= 800:
+            large[labels == index] = 255
+    large_points = cv2.findNonZero(large)
+    large_box = box_from_points(large_points) if large_points is not None else None
+    near_large = cv2.dilate(large, np.ones((31, 31), np.uint8))
+
+    cleaned = np.zeros_like(retained)
+    removed: list[dict[str, Any]] = []
+    for index in range(1, count):
+        x, y, w, h, area = (int(value) for value in stats[index])
+        component = labels == index
+        center_inside_large_box = (
+            large_box is not None
+            and large_box.x - 24 <= x + w / 2 <= large_box.x2 + 24
+            and large_box.y - 24 <= y + h / 2 <= large_box.y2 + 24
+        )
+        if area >= 800 or center_inside_large_box or np.any(near_large[component]):
+            cleaned[component] = 255
+            continue
+        removed.append(
+            {
+                "bbox": {"x": x, "y": y, "width": w, "height": h},
+                "area": area,
+                "reason": "isolated_from_main_wall_network",
+            }
+        )
+
+    filter_report.update(
+        {
+            "removed_isolated_wall_noise_pixels": int(
+                np.count_nonzero(cv2.bitwise_and(retained, cv2.bitwise_not(cleaned)))
+            ),
+            "removed_isolated_wall_noise_components": removed,
+            "retained_wall_pixels_after_noise_removal": int(np.count_nonzero(cleaned)),
+        }
+    )
+    return cleaned, filter_report
+
+
+def recover_wall_fragments(
+    ink: np.ndarray, retained: np.ndarray, filter_report: dict[str, Any]
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Recover wall-like fragments dropped by the coarse width filter."""
+    lost = cv2.bitwise_and(ink, cv2.bitwise_not(retained))
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(lost, 8)
+    if count <= 1 or not np.any(retained):
+        filter_report.update(
+            {
+                "recovered_wall_pixels": 0,
+                "recovered_wall_components": 0,
+                "recovery_reasons": [],
+            }
+        )
+        return retained, filter_report
+
+    height, width = ink.shape
+    retained_near = cv2.dilate(retained, np.ones((17, 17), np.uint8))
+    retained_touch = cv2.dilate(retained, np.ones((5, 5), np.uint8))
+    retained_points = cv2.findNonZero(retained)
+    retained_box: Box | None = None
+    wall_roi = np.zeros_like(ink)
+    if retained_points is not None:
+        retained_box = box_from_points(retained_points)
+        wall_box = clip_box(retained_box, width, height, padding=24)
+        mask_box(wall_roi, wall_box)
+
+    recovered = np.zeros_like(ink)
+    reasons: list[dict[str, Any]] = []
+    for index in range(1, count):
+        x, y, w, h, area = (int(value) for value in stats[index])
+        if area < 80:
+            continue
+
+        component = labels == index
+        bbox_area = max(w * h, 1)
+        fill_ratio = area / bbox_area
+        aspect = max(w, h) / max(min(w, h), 1)
+        orientation = "horizontal" if w >= h else "vertical"
+        thickness = min(w, h)
+        length = max(w, h)
+        in_wall_roi = bool(np.any(wall_roi[component]))
+        near_ratio = float(np.count_nonzero(retained_near[component])) / max(area, 1)
+        touch_ratio = float(np.count_nonzero(retained_touch[component])) / max(area, 1)
+
+        # Dimension lines and window/frame strokes are long, very thin, and
+        # usually have little or no contact with the retained wall core.
+        if thickness <= 4 and aspect >= 18:
+            continue
+        if aspect >= 45 and touch_ratio < 0.03:
+            continue
+
+        # Text, numbers, door arcs, and symbols are sparse inside their boxes;
+        # solid wall fragments and wall caps have a much higher fill ratio.
+        if fill_ratio < 0.22:
+            continue
+        is_short_solid_pier = (
+            in_wall_roi
+            and fill_ratio >= 0.65
+            and thickness >= 6
+            and 10 <= length < 28
+            and aspect <= 8
+            and near_ratio >= 0.04
+        )
+        if length < 28 and touch_ratio < 0.12 and not is_short_solid_pier:
+            continue
+        if not in_wall_roi and touch_ratio < 0.12:
+            continue
+
+        recover_reason: str | None = None
+        if touch_ratio >= 0.08:
+            recover_reason = "connected_to_retained_wall"
+        elif is_short_solid_pier:
+            recover_reason = "door_side_short_pier"
+        elif in_wall_roi and fill_ratio >= 0.45 and thickness >= 7 and length >= 35 and aspect <= 30:
+            recover_reason = "interior_long_wall_fragment"
+        elif near_ratio >= 0.18 and thickness >= 8 and length >= 45:
+            recover_reason = "parallel_or_collinear_near_retained_wall"
+        elif near_ratio >= 0.10 and fill_ratio >= 0.40 and thickness >= 8:
+            recover_reason = "wall_cap_or_short_pier_near_opening"
+
+        if recover_reason is None:
+            continue
+
+        recovered[component] = 255
+        reasons.append(
+            {
+                "bbox": {"x": x, "y": y, "width": w, "height": h},
+                "area": area,
+                "orientation": orientation,
+                "fill_ratio": round(float(fill_ratio), 4),
+                "near_retained_ratio": round(float(near_ratio), 4),
+                "touch_retained_ratio": round(float(touch_ratio), 4),
+                "reason": recover_reason,
+            }
+        )
+
+    line_recovered = recover_lost_wall_lines(lost, retained, wall_roi)
+    line_only = cv2.bitwise_and(line_recovered, cv2.bitwise_not(recovered))
+    line_count, _, line_stats, _ = cv2.connectedComponentsWithStats(line_only, 8)
+    for index in range(1, line_count):
+        x, y, w, h, area = (int(value) for value in line_stats[index])
+        if area < 80:
+            continue
+        recovered[y : y + h, x : x + w][line_only[y : y + h, x : x + w] > 0] = 255
+        reasons.append(
+            {
+                "bbox": {"x": x, "y": y, "width": w, "height": h},
+                "area": area,
+                "orientation": "horizontal" if w >= h else "vertical",
+                "fill_ratio": round(float(area / max(w * h, 1)), 4),
+                "near_retained_ratio": None,
+                "touch_retained_ratio": None,
+                "reason": "straight_lost_wall_line",
+            }
+        )
+
+    result = cv2.bitwise_or(retained, recovered)
+    recovered_pixels = int(np.count_nonzero(recovered))
+    filter_report.update(
+        {
+            "recovered_wall_pixels": recovered_pixels,
+            "recovered_wall_components": len(reasons),
+            "recovery_reasons": reasons,
+            "retained_wall_pixels_before_recovery": int(np.count_nonzero(retained)),
+            "retained_wall_pixels": int(np.count_nonzero(result)),
+            "retained_pixel_ratio": round(
+                np.count_nonzero(result) / max(np.count_nonzero(ink), 1), 4
+            ),
+        }
+    )
+    return result, filter_report
+
+
+def recover_lost_wall_lines(
+    lost: np.ndarray, retained: np.ndarray, wall_roi: np.ndarray
+) -> np.ndarray:
+    """Extract long, wall-width straight strokes from dropped ink."""
+    height, width = lost.shape
+    retained_near = cv2.dilate(retained, np.ones((21, 21), np.uint8))
+    roi_lost = cv2.bitwise_and(lost, wall_roi)
+    horizontal = cv2.morphologyEx(roi_lost, cv2.MORPH_OPEN, np.ones((7, 32), np.uint8))
+    vertical = cv2.morphologyEx(roi_lost, cv2.MORPH_OPEN, np.ones((32, 7), np.uint8))
+    line_seeds = cv2.bitwise_or(horizontal, vertical)
+    line_seeds = cv2.bitwise_and(line_seeds, cv2.dilate(line_seeds, np.ones((3, 3), np.uint8)))
+    candidates = cv2.bitwise_and(cv2.dilate(line_seeds, np.ones((3, 3), np.uint8)), lost)
+
+    result = np.zeros_like(lost)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(candidates, 8)
+    for index in range(1, count):
+        x, y, w, h, area = (int(value) for value in stats[index])
+        if area < 80:
+            continue
+        thickness = min(w, h)
+        length = max(w, h)
+        aspect = length / max(thickness, 1)
+        if thickness < 6 or length < 35:
+            continue
+        if aspect > 35:
+            continue
+        component = labels == index
+        near_ratio = float(np.count_nonzero(retained_near[component])) / max(area, 1)
+        if near_ratio < 0.04:
+            continue
+        result[component] = 255
+    return result
+
+
 def detect_walls(ink: np.ndarray) -> tuple[np.ndarray, list[WallSegment], Box]:
     height, width = ink.shape
     stroke = max(3, int(round(min(height, width) * 0.004)))
@@ -242,6 +462,7 @@ def detect_walls(ink: np.ndarray) -> tuple[np.ndarray, list[WallSegment], Box]:
     recovered = cv2.dilate(seeds, np.ones((stroke, stroke), np.uint8))
     walls = cv2.bitwise_and(recovered, ink)
     walls = cv2.morphologyEx(walls, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    walls = cv2.bitwise_or(walls, recover_short_wall_caps(ink, walls))
 
     # Thick-stroke filtering already removed dimension graphics, so the union
     # of all wall pixels is a better building extent than a single connected
@@ -270,6 +491,33 @@ def detect_walls(ink: np.ndarray) -> tuple[np.ndarray, list[WallSegment], Box]:
             )
     segments.sort(key=lambda segment: segment.length_px, reverse=True)
     return walls, segments, plan_box
+
+
+def recover_short_wall_caps(ink: np.ndarray, walls: np.ndarray) -> np.ndarray:
+    """Preserve short solid wall piers removed by directional opening."""
+    missing = cv2.bitwise_and(ink, cv2.bitwise_not(walls))
+    near_walls = cv2.dilate(walls, np.ones((17, 17), np.uint8))
+    result = np.zeros_like(ink)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(missing, 8)
+    for index in range(1, count):
+        x, y, w, h, area = (int(value) for value in stats[index])
+        if area < 40:
+            continue
+        bbox_area = max(w * h, 1)
+        fill_ratio = area / bbox_area
+        thickness = min(w, h)
+        length = max(w, h)
+        aspect = length / max(thickness, 1)
+        if thickness < 6 or length < 8 or fill_ratio < 0.65:
+            continue
+        if aspect > 12 and length < 18:
+            continue
+        component = labels == index
+        near_ratio = float(np.count_nonzero(near_walls[component])) / max(area, 1)
+        if near_ratio < 0.04:
+            continue
+        result[component] = 255
+    return result
 
 
 def calibrate_wall_geometry(
@@ -469,6 +717,100 @@ def longest_angular_run(edge: np.ndarray, cx: int, cy: int, radius: int) -> tupl
     return best_length / samples, start_deg, end_deg
 
 
+def angle_in_arc(angle_deg: float, start_deg: float, span_deg: float) -> bool:
+    return (angle_deg - start_deg) % 360.0 <= span_deg
+
+
+def collect_arc_edge_points(
+    edge: np.ndarray,
+    cx: float,
+    cy: float,
+    radius: float,
+    start_deg: float,
+    span_deg: float,
+    tolerance: float = 5.0,
+) -> np.ndarray:
+    """Collect actual edge pixels on the detected door arc sector."""
+    y_indices, x_indices = np.nonzero(edge)
+    if len(x_indices) == 0:
+        return np.empty((0, 2), dtype=np.float64)
+    dx = x_indices.astype(np.float64) - cx
+    dy = y_indices.astype(np.float64) - cy
+    distances = np.hypot(dx, dy)
+    angles = (np.degrees(np.arctan2(dy, dx)) + 360.0) % 360.0
+    keep = (np.abs(distances - radius) <= tolerance) & np.array(
+        [angle_in_arc(angle, start_deg, span_deg) for angle in angles],
+        dtype=bool,
+    )
+    if not np.any(keep):
+        return np.empty((0, 2), dtype=np.float64)
+    return np.column_stack((x_indices[keep], y_indices[keep])).astype(np.float64)
+
+
+def fit_circle_from_points(points: np.ndarray) -> tuple[float, float, float] | None:
+    """Least-squares circle fit for a compact arc point set."""
+    if len(points) < 8:
+        return None
+    x = points[:, 0]
+    y = points[:, 1]
+    a = np.column_stack((2.0 * x, 2.0 * y, np.ones_like(x)))
+    b = x * x + y * y
+    try:
+        cx, cy, c = np.linalg.lstsq(a, b, rcond=None)[0]
+    except np.linalg.LinAlgError:
+        return None
+    radius_sq = c + cx * cx + cy * cy
+    if radius_sq <= 0:
+        return None
+    radius = math.sqrt(radius_sq)
+    residual = np.median(np.abs(np.hypot(x - cx, y - cy) - radius))
+    if residual > 4.5:
+        return None
+    return float(cx), float(cy), float(radius)
+
+
+def refine_hough_door_arc(
+    edge: np.ndarray,
+    cx: int,
+    cy: int,
+    radius: int,
+    start_deg: float,
+    run_fraction: float,
+) -> tuple[int, int, int, float, float, float]:
+    """Refine Hough circle output using the actual supported arc edge pixels."""
+    span = max(10.0, min(150.0, run_fraction * 360.0))
+    points = collect_arc_edge_points(edge, cx, cy, radius, start_deg, span, tolerance=5.0)
+    fitted = fit_circle_from_points(points)
+    if fitted is None:
+        return int(cx), int(cy), int(radius), float(start_deg), float((start_deg + span) % 360.0), run_fraction
+
+    fitted_cx, fitted_cy, fitted_radius = fitted
+    # Do not allow a noisy partial contour to jump away from the detected hinge.
+    if math.hypot(fitted_cx - cx, fitted_cy - cy) > max(12.0, radius * 0.18):
+        return int(cx), int(cy), int(radius), float(start_deg), float((start_deg + span) % 360.0), run_fraction
+    if not (radius * 0.72 <= fitted_radius <= radius * 1.28):
+        return int(cx), int(cy), int(radius), float(start_deg), float((start_deg + span) % 360.0), run_fraction
+
+    refined_run, refined_start, refined_end = longest_angular_run(
+        edge,
+        int(round(fitted_cx)),
+        int(round(fitted_cy)),
+        int(round(fitted_radius)),
+    )
+    if refined_run < 0.06:
+        refined_start = start_deg
+        refined_end = (start_deg + span) % 360.0
+        refined_run = run_fraction
+    return (
+        int(round(fitted_cx)),
+        int(round(fitted_cy)),
+        int(round(fitted_radius)),
+        float(refined_start),
+        float(refined_end),
+        float(refined_run),
+    )
+
+
 def infer_swing_direction(start_deg: float, run_fraction: float) -> str:
     middle = (start_deg + run_fraction * 180.0) % 360.0
     vertical = "down" if 0.0 < middle < 180.0 else "up"
@@ -541,6 +883,9 @@ def detect_doors(
         run, start_deg, end_deg = longest_angular_run(edges, cx, cy, radius)
         if not (0.10 <= run <= 0.42):
             continue
+        cx, cy, radius, start_deg, end_deg, run = refine_hough_door_arc(
+            edges, cx, cy, radius, start_deg, run
+        )
         box = clip_box(
             tight_arc_bounding_box(cx, cy, radius, start_deg, run),
             width,
@@ -562,7 +907,7 @@ def detect_doors(
             swing_direction=infer_swing_direction(start_deg, run),
             confidence=round(confidence, 3),
             arc_start_deg=round(start_deg, 3),
-            arc_end_deg=round((start_deg + run * 360.0) % 360.0, 3),
+            arc_end_deg=round(end_deg, 3),
         )
         candidates.append((confidence, door, start_deg, end_deg))
 
@@ -593,7 +938,413 @@ def detect_doors(
             255,
             4,
         )
+    fallback_doors = detect_component_doors(gray, wall_mask, plan_box, doors)
+    for door in fallback_doors:
+        doors.append(door)
+        cv2.ellipse(
+            door_mask,
+            tuple(door.hinge),
+            (door.radius_px, door.radius_px),
+            0,
+            door.arc_start_deg,
+            door.arc_end_deg if door.arc_end_deg > door.arc_start_deg else door.arc_end_deg + 360,
+            255,
+            4,
+        )
     return door_mask, doors
+
+
+def detect_component_doors(
+    gray: np.ndarray,
+    wall_mask: np.ndarray,
+    plan_box: Box,
+    existing: Sequence[Door],
+) -> list[Door]:
+    """Fallback for door arcs that are too broken for global HoughCircles."""
+    ink = make_ink_mask(gray)
+    thin = ink.copy()
+    thin[cv2.dilate(wall_mask, np.ones((3, 3), np.uint8)) > 0] = 0
+    roi = np.zeros_like(thin)
+    mask_box(roi, clip_box(plan_box, thin.shape[1], thin.shape[0], padding=10))
+    source = cv2.bitwise_and(thin, roi)
+    grouped = cv2.dilate(source, np.ones((7, 7), np.uint8), iterations=1)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(grouped, 8)
+    near_wall = cv2.dilate(wall_mask, np.ones((21, 21), np.uint8))
+
+    doors: list[Door] = []
+    for index in range(1, count):
+        x, y, w, h, area = (int(value) for value in stats[index])
+        raw_pixels = int(np.count_nonzero(source[y : y + h, x : x + w]))
+        minor = min(w, h)
+        major = max(w, h)
+        if minor < 52 or major > 125 or major / max(minor, 1) > 1.7 or raw_pixels < 420:
+            continue
+        if any(
+            boxes_overlap_ratio(Box(x, y, w, h), door.bbox) >= 0.20
+            or math.dist((x + w / 2.0, y + h / 2.0), door.hinge) < 55
+            for door in existing
+        ):
+            continue
+        component = labels == index
+        if np.count_nonzero(near_wall[component]) / max(area, 1) < 0.10:
+            continue
+
+        fit = fit_component_door_arc(source, wall_mask, Box(x, y, w, h))
+        if fit is None:
+            continue
+        hinge, radius, arc_start_deg, arc_end_deg, fit_score = fit
+        horizontal_score = np.count_nonzero(
+            wall_mask[
+                max(0, hinge[1] - 8) : min(gray.shape[0], hinge[1] + 9),
+                max(0, hinge[0] - radius) : min(gray.shape[1], hinge[0] + radius),
+            ]
+        )
+        vertical_score = np.count_nonzero(
+            wall_mask[
+                max(0, hinge[1] - radius) : min(gray.shape[0], hinge[1] + radius),
+                max(0, hinge[0] - 8) : min(gray.shape[1], hinge[0] + 9),
+            ]
+        )
+        orientation = "horizontal" if horizontal_score >= vertical_score else "vertical"
+        doors.append(
+            Door(
+                bbox=clip_box(
+                    tight_arc_bounding_box(
+                        float(hinge[0]),
+                        float(hinge[1]),
+                        float(radius),
+                        float(arc_start_deg),
+                        0.25,
+                    ),
+                    gray.shape[1],
+                    gray.shape[0],
+                ),
+                hinge=[int(hinge[0]), int(hinge[1])],
+                radius_px=radius,
+                wall_orientation=orientation,
+                swing_direction=infer_swing_direction(float(arc_start_deg), 0.25),
+                confidence=round(min(0.84, 0.64 + fit_score * 0.25), 3),
+                arc_start_deg=float(arc_start_deg),
+                arc_end_deg=float(arc_end_deg),
+            )
+        )
+    return doors
+
+
+def boxes_overlap_ratio(first: Box, second: Box) -> float:
+    overlap_width = max(0, min(first.x2, second.x2) - max(first.x, second.x))
+    overlap_height = max(0, min(first.y2, second.y2) - max(first.y, second.y))
+    return overlap_width * overlap_height / max(min(first.width * first.height, second.width * second.height), 1)
+
+
+def infer_component_door_hinge(wall_mask: np.ndarray, box: Box) -> tuple[tuple[int, int], int]:
+    corners = [
+        ((box.x, box.y), 0),
+        ((box.x2, box.y), 90),
+        ((box.x2, box.y2), 180),
+        ((box.x, box.y2), 270),
+    ]
+    best_corner, best_quadrant, best_score = corners[0][0], corners[0][1], -1
+    for (cx, cy), quadrant in corners:
+        x1, x2 = max(0, cx - 14), min(wall_mask.shape[1], cx + 15)
+        y1, y2 = max(0, cy - 14), min(wall_mask.shape[0], cy + 15)
+        score = int(np.count_nonzero(wall_mask[y1:y2, x1:x2]))
+        if score > best_score:
+            best_corner, best_quadrant, best_score = (cx, cy), quadrant, score
+    return best_corner, best_quadrant
+
+
+def mask_window_count(mask: np.ndarray, cx: int, cy: int, radius: int = 2) -> int:
+    height, width = mask.shape
+    x1, x2 = max(0, cx - radius), min(width, cx + radius + 1)
+    y1, y2 = max(0, cy - radius), min(height, cy + radius + 1)
+    if x1 >= x2 or y1 >= y2:
+        return 0
+    return int(np.count_nonzero(mask[y1:y2, x1:x2]))
+
+
+def arc_support_fraction(
+    mask: np.ndarray,
+    hinge: tuple[int, int],
+    radius: int,
+    start_deg: int,
+    end_deg: int,
+) -> float:
+    """Score how much of a quarter door arc is supported by actual ink pixels."""
+    cx, cy = hinge
+    total = 0
+    hits = 0
+    for degree in range(start_deg, end_deg + 1, 3):
+        angle = math.radians(degree % 360)
+        x = int(round(cx + radius * math.cos(angle)))
+        y = int(round(cy + radius * math.sin(angle)))
+        total += 1
+        if mask_window_count(mask, x, y, radius=3) > 0:
+            hits += 1
+    return hits / max(total, 1)
+
+
+def supported_arc_run(
+    mask: np.ndarray,
+    hinge: tuple[int, int],
+    radius: int,
+    start_deg: int,
+    end_deg: int,
+) -> tuple[float, int, int]:
+    """Return the best contiguous supported angular run inside a door quadrant."""
+    cx, cy = hinge
+    angles = list(range(start_deg, end_deg + 1, 2))
+    hits: list[int] = []
+    for degree in angles:
+        angle = math.radians(degree % 360)
+        x = int(round(cx + radius * math.cos(angle)))
+        y = int(round(cy + radius * math.sin(angle)))
+        if mask_window_count(mask, x, y, radius=3) > 0:
+            hits.append(degree)
+    if not hits:
+        return 0.0, start_deg, end_deg % 360
+
+    runs: list[list[int]] = []
+    current = [hits[0]]
+    for previous, degree in zip(hits, hits[1:]):
+        if degree - previous <= 6:
+            current.append(degree)
+        else:
+            runs.append(current)
+            current = [degree]
+    runs.append(current)
+    best = max(runs, key=len)
+    # Door arcs in scanned plans are often broken at wall intersections.  Expand
+    # only slightly so the reported endpoints stay tied to real observed pixels.
+    actual_start = max(start_deg, best[0] - 2)
+    actual_end = min(end_deg, best[-1] + 2)
+    coverage = len(best) / max(len(angles), 1)
+    return coverage, actual_start % 360, actual_end % 360
+
+
+def radial_line_support_fraction(
+    mask: np.ndarray,
+    hinge: tuple[int, int],
+    radius: int,
+    angle_deg: int,
+) -> float:
+    """Score support for the door leaf line that starts at the hinge."""
+    cx, cy = hinge
+    hits = 0
+    total = 0
+    angle = math.radians(angle_deg % 360)
+    for distance in range(8, max(9, radius + 1), 4):
+        x = int(round(cx + distance * math.cos(angle)))
+        y = int(round(cy + distance * math.sin(angle)))
+        total += 1
+        if mask_window_count(mask, x, y, radius=2) > 0:
+            hits += 1
+    return hits / max(total, 1)
+
+
+def fit_component_door_arc(
+    source: np.ndarray,
+    wall_mask: np.ndarray,
+    box: Box,
+) -> tuple[tuple[int, int], int, int, int, float] | None:
+    """Fit a fallback door arc from the component ink, not from the loose box.
+
+    The previous fallback used a bbox corner and ``major * 0.85`` radius.  That
+    over-sized arcs for rectangular door components, so the drawn quarter arc no
+    longer sat on the source image.  Here each possible hinge corner is scored
+    against the actual foreground arc and leaf pixels; radius is constrained by
+    the shorter bbox side, matching the tight visual evidence rule.
+    """
+    minor = min(box.width, box.height)
+    if minor < 20:
+        return None
+    corners = [
+        ((box.x, box.y), 0, 90, (0, 90), (1, 1)),
+        ((box.x2 - 1, box.y), 90, 180, (90, 180), (-1, 1)),
+        ((box.x2 - 1, box.y2 - 1), 180, 270, (180, 270), (-1, -1)),
+        ((box.x, box.y2 - 1), 270, 360, (270, 0), (1, -1)),
+    ]
+    min_radius = max(22, int(minor * 0.68))
+    max_radius = max(min_radius, int(minor * 1.12))
+    best: tuple[float, tuple[int, int], int, int, int] | None = None
+    for corner, start_deg, end_deg, leaf_angles, inward in corners:
+        # The true hinge is normally close to, but not exactly on, the grouped
+        # component bbox corner because dilation and wall removal shift the box.
+        hinge_candidates: list[tuple[int, int]] = []
+        for dx in (-6, -3, 0, 3, 6):
+            for dy in (-6, -3, 0, 3, 6):
+                hx = int(corner[0] + dx * inward[0])
+                hy = int(corner[1] + dy * inward[1])
+                if box.x - 8 <= hx <= box.x2 + 8 and box.y - 8 <= hy <= box.y2 + 8:
+                    hinge_candidates.append((hx, hy))
+        for hinge in hinge_candidates:
+            wall_contact = min(mask_window_count(wall_mask, hinge[0], hinge[1], radius=16) / 120.0, 1.0)
+            for radius in range(min_radius, max_radius + 1, 2):
+                run_score, actual_start, actual_end = supported_arc_run(
+                    source, hinge, radius, start_deg, end_deg
+                )
+                leaf_score = max(
+                    radial_line_support_fraction(source, hinge, radius, angle)
+                    for angle in leaf_angles
+                )
+                if run_score < 0.08 and leaf_score < 0.18:
+                    continue
+                span = (actual_end - actual_start) % 360
+                if not (18 <= span <= 100):
+                    continue
+                score = run_score * 0.70 + leaf_score * 0.20 + wall_contact * 0.10
+                if best is None or score > best[0]:
+                    best = (score, hinge, radius, actual_start, actual_end)
+    if best is None or best[0] < 0.18:
+        return None
+    score, hinge, radius, start_deg, end_deg = best
+    return hinge, int(radius), int(start_deg), int(end_deg), float(score)
+
+
+def arc_endpoint(door: Door, angle_deg: float) -> tuple[int, int]:
+    angle = math.radians(angle_deg % 360.0)
+    return (
+        int(round(door.hinge[0] + door.radius_px * math.cos(angle))),
+        int(round(door.hinge[1] + door.radius_px * math.sin(angle))),
+    )
+
+
+def recover_walls_adjacent_to_doors(
+    ink: np.ndarray,
+    wall_mask: np.ndarray,
+    door_mask: np.ndarray,
+    doors: Sequence[Door],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Recover true wall pixels at door-contact locations.
+
+    A valid swinging door should touch wall geometry at the hinge/leaf endpoint
+    side.  The coarse wall filter can drop short piers next to doors; recover
+    only original ink pixels that are both close to a detected door anchor and
+    close to the current wall mask.  This keeps the wall/door contract tight
+    without inventing geometry or absorbing door arcs into the wall layer.
+    """
+    if not doors:
+        return wall_mask, {
+            "door_adjacent_wall_recovered_pixels": 0,
+            "door_adjacent_wall_components": [],
+            "door_wall_gap_rule_applied": False,
+        }
+
+    height, width = ink.shape
+    missing = cv2.bitwise_and(ink, cv2.bitwise_not(wall_mask))
+    near_wall = cv2.dilate(wall_mask, np.ones((39, 39), np.uint8))
+    # Use a light door exclusion.  Solid wall piers survive the fill-ratio test,
+    # while thin arcs/leaf strokes near the door are rejected.
+    near_door = cv2.dilate(door_mask, np.ones((9, 9), np.uint8))
+
+    anchor_mask = np.zeros_like(ink)
+    leaf_exclusion = np.zeros_like(ink)
+    door_anchor_records: list[dict[str, Any]] = []
+    for door_index, door in enumerate(doors, 1):
+        endpoints = [
+            arc_endpoint(door, door.arc_start_deg),
+            arc_endpoint(door, door.arc_end_deg),
+            (int(door.hinge[0]), int(door.hinge[1])),
+        ]
+        for point in endpoints:
+            cv2.circle(anchor_mask, point, 46, 255, -1)
+        # The radial strokes from hinge to arc endpoints are door-leaf/opening
+        # evidence, not wall evidence.  Exclude this corridor before accepting
+        # relaxed door-side wall recovery.
+        for point in endpoints[:2]:
+            cv2.line(
+                leaf_exclusion,
+                (int(door.hinge[0]), int(door.hinge[1])),
+                (int(point[0]), int(point[1])),
+                255,
+                9,
+            )
+        door_anchor_records.append(
+            {
+                "door_index": door_index,
+                "hinge": list(door.hinge),
+                "arc_start_endpoint": list(endpoints[0]),
+                "arc_end_endpoint": list(endpoints[1]),
+            }
+        )
+
+    candidate_area = cv2.bitwise_and(missing, anchor_mask)
+    candidate_area = cv2.bitwise_and(candidate_area, near_wall)
+    # Rejoin chopped wall-end pixels locally, but only inside the door-anchor
+    # evidence zone.
+    candidate_area = cv2.morphologyEx(candidate_area, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(candidate_area, 8)
+
+    recovered = np.zeros_like(ink)
+    components: list[dict[str, Any]] = []
+    for index in range(1, count):
+        x, y, w, h, area = (int(value) for value in stats[index])
+        if area < 24:
+            continue
+        bbox_area = max(w * h, 1)
+        fill_ratio = area / bbox_area
+        thickness = min(w, h)
+        length = max(w, h)
+        aspect = length / max(thickness, 1)
+        component = labels == index
+        near_door_ratio = float(np.count_nonzero(near_door[component])) / max(area, 1)
+        near_wall_ratio = float(np.count_nonzero(near_wall[component])) / max(area, 1)
+        leaf_overlap_ratio = float(np.count_nonzero(leaf_exclusion[component])) / max(area, 1)
+        component_image = np.zeros_like(ink)
+        component_image[component] = 255
+        thick_core = cv2.erode(component_image, np.ones((7, 7), np.uint8), iterations=1)
+        thick_core_pixels = int(np.count_nonzero(thick_core))
+
+        # Door arcs and leaf lines are thin/sparse; wall piers are compact solid
+        # strokes.  Allow short dense blocks and short wall-like bars, reject
+        # long dimension/text strokes near the drawing.
+        is_thick_wall_ink = thick_core_pixels >= 1 or (thickness >= 12 and fill_ratio >= 0.55)
+        solid_pier = (
+            fill_ratio >= 0.48
+            and is_thick_wall_ink
+            and 10 <= length <= 95
+            and aspect <= 8
+        )
+        wall_bar = (
+            fill_ratio >= 0.36
+            and is_thick_wall_ink
+            and 18 <= length <= 140
+            and aspect <= 12
+        )
+        if not (solid_pier or wall_bar):
+            continue
+        if near_wall_ratio < 0.18:
+            continue
+        if (
+            leaf_overlap_ratio > 0.25
+            and aspect >= 2.2
+            and not (fill_ratio >= 0.75 and thickness >= 12 and length <= 45)
+        ):
+            continue
+        if near_door_ratio > 0.35 and (fill_ratio < 0.75 or not is_thick_wall_ink):
+            continue
+
+        recovered[component] = 255
+        components.append(
+            {
+                "bbox": {"x": x, "y": y, "width": w, "height": h},
+                "area": area,
+                "fill_ratio": round(float(fill_ratio), 4),
+                "near_wall_ratio": round(float(near_wall_ratio), 4),
+                "near_door_ratio": round(float(near_door_ratio), 4),
+                "leaf_overlap_ratio": round(float(leaf_overlap_ratio), 4),
+                "thick_core_pixels": thick_core_pixels,
+                "reason": "door_wall_no_gap_recovery",
+            }
+        )
+
+    result = cv2.bitwise_or(wall_mask, recovered)
+    return result, {
+        "door_adjacent_wall_recovered_pixels": int(np.count_nonzero(recovered)),
+        "door_adjacent_wall_components": components,
+        "door_wall_gap_rule_applied": True,
+        "door_anchor_points": door_anchor_records,
+    }
 
 
 def find_text_regions(
@@ -652,6 +1403,9 @@ def run_ocr(
     boxes = list(boxes)
     if not boxes:
         return []
+    if not lang:
+        warnings.append("OCR 已禁用；已检测文字候选区域，但 room_labels/dimensions 的 text 为 null。")
+        return [TextRegion(box, None, 0.35) for box in boxes]
     if not shutil.which("tesseract"):
         warnings.append(
             "未找到 Tesseract 可执行文件；已检测文字候选区域，但 room_labels/dimensions 的 text 为 null。"
@@ -727,6 +1481,12 @@ def process_floor_plan(
     wall_candidate_ink, wall_width_filter = filter_wall_ink_by_width(
         ink, width_reduction_px=10
     )
+    wall_candidate_ink, wall_width_filter = remove_isolated_wall_noise(
+        wall_candidate_ink, wall_width_filter
+    )
+    wall_candidate_ink, wall_width_filter = recover_wall_fragments(
+        ink, wall_candidate_ink, wall_width_filter
+    )
     wall_mask, wall_segments, plan_box = detect_walls(wall_candidate_ink)
     calibrated_walls = (
         calibrate_wall_geometry(plan_box, wall_segments, wall_calibration)
@@ -740,6 +1500,13 @@ def process_floor_plan(
     # Detect doors without masking possible window regions, then remove every
     # window candidate occupying a detected door-arc box.
     door_mask, doors = detect_doors(gray, wall_mask, plan_box, np.zeros_like(gray))
+    wall_mask, door_wall_recovery = recover_walls_adjacent_to_doors(
+        ink, wall_mask, door_mask, doors
+    )
+    # Recompute the removable thin layer after door-adjacent wall recovery so
+    # recovered wall piers are not later classified as text/window/other.
+    thin_ink = ink.copy()
+    thin_ink[cv2.dilate(wall_mask, np.ones((3, 3), np.uint8)) > 0] = 0
     window_mask, windows = detect_windows(thin_ink, wall_mask, plan_box)
     filtered_windows: list[Opening] = []
     window_mask = np.zeros_like(gray)
@@ -817,6 +1584,7 @@ def process_floor_plan(
         "walls": [asdict(item) for item in wall_segments],
         "wall_calibration": calibrated_walls,
         "wall_width_filter": wall_width_filter,
+        "door_wall_recovery": door_wall_recovery,
         "doors": [asdict(item) for item in doors],
         "windows": [asdict(item) for item in windows],
         "room_labels": [asdict(item) for item in room_labels],
@@ -858,6 +1626,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Tesseract OCR 语言，默认 chi_sim+eng",
     )
     parser.add_argument(
+        "--no-ocr",
+        action="store_true",
+        help="禁用 OCR，只输出文字候选框和空 text，用于几何调试。",
+    )
+    parser.add_argument(
         "--no-deskew", action="store_true", help="禁用自动倾斜校正"
     )
     parser.add_argument(
@@ -876,7 +1649,7 @@ def main() -> int:
     report = process_floor_plan(
         args.input,
         args.output_dir,
-        ocr_lang=args.ocr_lang,
+        ocr_lang="" if args.no_ocr else args.ocr_lang,
         apply_deskew=not args.no_deskew,
         wall_calibration=(
             STANDARD_ANSWER_WALL_CALIBRATION

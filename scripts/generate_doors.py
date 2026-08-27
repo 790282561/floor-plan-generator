@@ -30,7 +30,8 @@ WALL_LAYERS = {"WALLS", "INNER_WALLS"}
 WINDOW_LAYER = "WINDOWS"
 DOOR_LAYER = "DOORS"
 ROOM_LAYER = "ROOM_NAMES"
-CHINESE_FONT = "msyh.ttc"
+ROOM_FONT = "simhei.ttf"
+ROOM_FONT_PATH = Path(r"C:\Windows\Fonts\simhei.ttf")
 
 
 @dataclass(frozen=True)
@@ -1250,7 +1251,7 @@ def draw_preview(doc, path: Path, overall_width_mm: float, overall_height_mm: fl
     draw = ImageDraw.Draw(image)
     try:
         room_font = ImageFont.truetype(
-            r"C:\Windows\Fonts\msyh.ttc", max(16, int(260 * scale))
+            str(ROOM_FONT_PATH), max(16, int(260 * scale))
         )
     except OSError:
         room_font = None
@@ -1365,6 +1366,34 @@ def load_preprocessing_doors(path: Path | None) -> list[PixelDoor]:
             orientation_hint=orientation,
         ))
     return result
+
+
+def pixel_door_overlap_ratio(first: PixelDoor, second: PixelDoor) -> float:
+    x1 = max(first.x, second.x)
+    y1 = max(first.y, second.y)
+    x2 = min(first.x + first.width, second.x + second.width)
+    y2 = min(first.y + first.height, second.y + second.height)
+    overlap = max(0, x2 - x1) * max(0, y2 - y1)
+    first_area = max(first.width * first.height, 1)
+    second_area = max(second.width * second.height, 1)
+    return overlap / max(min(first_area, second_area), 1)
+
+
+def merge_pixel_doors(primary: Sequence[PixelDoor], fallback: Sequence[PixelDoor]) -> list[PixelDoor]:
+    result = list(primary)
+    for door in fallback:
+        duplicate = False
+        for existing in result:
+            center_distance = math.dist(
+                (door.x + door.width / 2.0, door.y + door.height / 2.0),
+                (existing.x + existing.width / 2.0, existing.y + existing.height / 2.0),
+            )
+            if pixel_door_overlap_ratio(door, existing) >= 0.25 or center_distance < 45:
+                duplicate = True
+                break
+        if not duplicate:
+            result.append(door)
+    return sorted(result, key=lambda item: (item.y, item.x))
 
 
 def is_valid_room_name(value: object) -> bool:
@@ -1485,7 +1514,7 @@ def add_required_room_labels(
         doc.layers.add(ROOM_LAYER, color=3, linetype="CONTINUOUS")
     style_name = "FP-TEXT"
     if style_name not in doc.styles:
-        doc.styles.add(style_name, font=CHINESE_FONT)
+        doc.styles.add(style_name, font=ROOM_FONT)
     text_height = max(220.0, min(420.0, min(overall_width_mm, overall_height_mm) / 32.0))
     records: list[dict] = []
     for index, item in enumerate(items, start=1):
@@ -1540,10 +1569,17 @@ def generate(
         door_mask = np.zeros_like(source_gray)
         rejected_components = []
         detection_warning = str(error)
+    preprocessing_doors = load_preprocessing_doors(preprocessing_result)
     preprocessing_fallback = False
+    preprocessing_merged = 0
     if not pixel_doors:
-        pixel_doors = load_preprocessing_doors(preprocessing_result)
+        pixel_doors = preprocessing_doors
         preprocessing_fallback = bool(pixel_doors)
+        preprocessing_merged = len(pixel_doors)
+    elif preprocessing_doors:
+        before_merge = len(pixel_doors)
+        pixel_doors = merge_pixel_doors(pixel_doors, preprocessing_doors)
+        preprocessing_merged = len(pixel_doors) - before_merge
     stage_issues: list[str] = []
     if detection_warning:
         stage_issues.append(f"门差分检测降级：{detection_warning}")
@@ -1734,6 +1770,8 @@ def generate(
         "wall_baseline_sha256": file_sha256(wall_window_dxf),
         "wall_baseline_policy": "fixed-source-image-geometry",
         "wall_entities_unchanged": True,
+        "room_name_font": ROOM_FONT,
+        "room_name_font_path": str(ROOM_FONT_PATH),
         "output": str(output.resolve()),
         "overall_width_mm": overall_width_mm,
         "overall_height_mm": overall_height_mm,
@@ -1743,6 +1781,8 @@ def generate(
         "preprocessing_evidence": load_preprocessing_evidence(preprocessing_result),
         "pixel_candidates": len(pixel_doors),
         "preprocessing_candidate_fallback": preprocessing_fallback,
+        "preprocessing_candidates": len(preprocessing_doors),
+        "preprocessing_candidates_merged": preprocessing_merged,
         "accepted_doors": len(accepted),
         "accepted_image_only_doors": sum(
             1 for item in records if item.get("status") == "ACCEPTED_IMAGE_ONLY"
