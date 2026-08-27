@@ -662,8 +662,9 @@ def extract_wall_geometry(
 def mask_connected_fragment_rectangles(
     candidates: list[dict[str, int | list[int]]],
     base_rectangles: list[tuple[float, float, float, float]],
+    wall_evidence: np.ndarray,
 ) -> tuple[list[tuple[float, float, float, float]], list[dict[str, Any]]]:
-    """Normalize each omitted short mask branch and overlap it into its parent."""
+    """Normalize each omitted short mask branch without flattening its offset."""
     rectangles: list[tuple[float, float, float, float]] = []
     normalized: list[dict[str, Any]] = []
     assigned_width = min(WALL_WIDTHS_MM)
@@ -671,22 +672,43 @@ def mask_connected_fragment_rectangles(
         x, y, width, height = (int(value) for value in candidate["bbox_px"])
         if width < 1 or height < 1:
             continue
-        horizontal = width >= height
+        # Use the original mask pixels, not the red-only difference image, to
+        # choose orientation.  The difference image may have lost one side of
+        # a branch where it overlaps an already-generated parent wall.
+        source_patch = wall_evidence[y:y + height, x:x + width] < 127
+        source_points = cv2.findNonZero(np.uint8(source_patch))
+        if source_points is not None:
+            _sx, _sy, source_width, source_height = cv2.boundingRect(source_points)
+        else:
+            source_width, source_height = width, height
+        horizontal = source_width > source_height
         overlap_px = max(1, min(width, height))
         connected_to: int | None = None
+        connector: tuple[float, float, float, float] | None = None
         if horizontal:
             start = to_cad((x - overlap_px, y + height // 2))[0]
             end = to_cad((x + width - 1 + overlap_px, y + height // 2))[0]
             center = to_cad((x + width // 2, y + height // 2))[1]
             options = [
-                (abs((ry1 + ry2) / 2 - center), index, (ry1 + ry2) / 2)
+                (abs((ry1 + ry2) / 2 - center), index, (rx1, ry1, rx2, ry2))
                 for index, (rx1, ry1, rx2, ry2) in enumerate(base_rectangles)
                 if max(min(start, end), rx1) <= min(max(start, end), rx2)
             ]
             if options:
-                distance, connected_to, parent_center = min(options)
+                distance, connected_to, parent = min(options)
                 if distance <= assigned_width * 2:
-                    center = parent_center
+                    # Keep the source-derived branch centreline.  Only bridge
+                    # the actual gap to the parent so a protrusion stays a
+                    # protrusion after standard-width normalization.
+                    anchor = (max(min(start, end), parent[0]) + min(max(start, end), parent[2])) / 2
+                    branch_low = center - assigned_width / 2
+                    branch_high = center + assigned_width / 2
+                    if branch_high < parent[1]:
+                        connector = (anchor - assigned_width / 2, branch_high,
+                                     anchor + assigned_width / 2, parent[1])
+                    elif branch_low > parent[3]:
+                        connector = (anchor - assigned_width / 2, parent[3],
+                                     anchor + assigned_width / 2, branch_low)
                 else:
                     connected_to = None
             rectangle = (min(start, end), center - assigned_width / 2,
@@ -697,14 +719,22 @@ def mask_connected_fragment_rectangles(
             end = to_cad((x + width // 2, y + height - 1 + overlap_px))[1]
             center = to_cad((x + width // 2, y + height // 2))[0]
             options = [
-                (abs((rx1 + rx2) / 2 - center), index, (rx1 + rx2) / 2)
+                (abs((rx1 + rx2) / 2 - center), index, (rx1, ry1, rx2, ry2))
                 for index, (rx1, ry1, rx2, ry2) in enumerate(base_rectangles)
                 if max(min(start, end), ry1) <= min(max(start, end), ry2)
             ]
             if options:
-                distance, connected_to, parent_center = min(options)
+                distance, connected_to, parent = min(options)
                 if distance <= assigned_width * 2:
-                    center = parent_center
+                    anchor = (max(min(start, end), parent[1]) + min(max(start, end), parent[3])) / 2
+                    branch_low = center - assigned_width / 2
+                    branch_high = center + assigned_width / 2
+                    if branch_high < parent[0]:
+                        connector = (branch_high, anchor - assigned_width / 2,
+                                     parent[0], anchor + assigned_width / 2)
+                    elif branch_low > parent[2]:
+                        connector = (parent[2], anchor - assigned_width / 2,
+                                     branch_low, anchor + assigned_width / 2)
                 else:
                     connected_to = None
             rectangle = (center - assigned_width / 2, min(start, end),
@@ -712,13 +742,19 @@ def mask_connected_fragment_rectangles(
             orientation = "vertical"
         rectangle = tuple(round(value, 3) for value in rectangle)
         rectangles.append(rectangle)
+        if connector is not None:
+            connector = tuple(round(value, 3) for value in connector)
+            if connector[0] < connector[2] and connector[1] < connector[3]:
+                rectangles.append(connector)
         normalized.append({
             **candidate,
             "orientation": orientation,
+            "source_mask_size_px": [source_width, source_height],
             "assigned_width_mm": assigned_width,
             "mask_overlap_px": overlap_px,
             "connected_to_base_rectangle": connected_to,
             "rectangle_mm": rectangle,
+            "connector_rectangle_mm": connector,
         })
     return rectangles, normalized
 
@@ -951,7 +987,9 @@ def generate(
     )
     fragment_rectangles, merged_short_wall_fragments = (
         mask_connected_fragment_rectangles(
-            provisional_fidelity["short_wall_fragment_candidates"], base_rectangles
+            provisional_fidelity["short_wall_fragment_candidates"],
+            base_rectangles,
+            wall_evidence,
         )
     )
     if fragment_rectangles:
