@@ -1479,7 +1479,7 @@ def process_floor_plan(
     ink = make_ink_mask(gray)
 
     wall_candidate_ink, wall_width_filter = filter_wall_ink_by_width(
-        ink, width_reduction_px=10
+        ink, width_reduction_px=6
     )
     wall_candidate_ink, wall_width_filter = remove_isolated_wall_noise(
         wall_candidate_ink, wall_width_filter
