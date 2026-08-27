@@ -1530,6 +1530,31 @@ def wall_entity_signature(msp) -> list[tuple]:
     return sorted(signature, key=repr)
 
 
+def extract_source_only_wall_fragments(
+    source: np.ndarray, result: np.ndarray
+) -> tuple[list[dict[str, int | list[int]]], list[dict[str, int | list[int]]]]:
+    """Return every red component and the short-wall candidates among them."""
+    source_only = np.uint8(source & ~result)
+    count, _labels, stats, _ = cv2.connectedComponentsWithStats(source_only, 8)
+    components: list[dict[str, int | list[int]]] = []
+    candidates: list[dict[str, int | list[int]]] = []
+    for index in range(1, count):
+        x, y, width, height, area = (int(value) for value in stats[index])
+        item: dict[str, int | list[int]] = {
+            "bbox_px": [x, y, width, height],
+            "area_px": area,
+        }
+        components.append(item)
+        # A large red run usually comes from permitted standard-width
+        # normalization.  Small, solid red runs near an otherwise matching
+        # wall are the short wall fragments that need explicit review.
+        if 32 <= area <= 512 and min(width, height) >= 3:
+            candidates.append(item)
+    components.sort(key=lambda item: int(item["area_px"]), reverse=True)
+    candidates.sort(key=lambda item: int(item["area_px"]), reverse=True)
+    return components, candidates
+
+
 def validate_wall_mask_fidelity(
     msp,
     frozen_wall_mask: np.ndarray,
@@ -1602,6 +1627,9 @@ def validate_wall_mask_fidelity(
     overlay[source] = (0, 0, 255)
     overlay[result] = (0, 255, 0)
     overlay[source & result] = (0, 255, 255)
+    source_only_components, short_wall_fragment_candidates = (
+        extract_source_only_wall_fragments(source, result)
+    )
     return {
         "status": "passed" if consistent else "severe_mismatch",
         "consistent": consistent,
@@ -1613,6 +1641,8 @@ def validate_wall_mask_fidelity(
         "buffered_cad_precision": round(precision, 4),
         "minimum_mask_recall": 0.90,
         "minimum_cad_precision": 0.70,
+        "source_only_wall_components": source_only_components,
+        "short_wall_fragment_candidates": short_wall_fragment_candidates,
     }, overlay
 
 
@@ -1687,7 +1717,7 @@ def generate(
     pixel_windows, door_arc_suppressed = suppress_windows_in_door_arc_regions(
         pixel_windows, door_boxes
     )
-    stage_issues: list[str] = []
+    stage_issues: list[Any] = []
     if outline is None:
         stage_issues.append("缺少闭合 building_outline；本次仅执行旧四线窗兼容检测")
     if frozen_wall_mask is None:
@@ -1804,6 +1834,13 @@ def generate(
             stage_issues.append(
                 "最终墙体与冻结 wall mask 严重不一致，可能存在墙体丢失或轮廓偏移"
             )
+        if wall_mask_fidelity["short_wall_fragment_candidates"]:
+            stage_issues.append({
+                "stage": "final_walls",
+                "issue": "source_only_short_wall_fragments",
+                "fragments": wall_mask_fidelity["short_wall_fragment_candidates"],
+                "suggested_repair": "检查红色短支墙是否应由墙条提取阶段保留",
+            })
 
     output.parent.mkdir(parents=True, exist_ok=True)
     wall_mask_overlay_path = output.with_name(output.stem + "_wall_mask_validation.png")
