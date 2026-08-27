@@ -320,7 +320,7 @@ def extract_standard_wall_rectangles(
 ) -> tuple[list[tuple[float, float, float, float]], list[dict]]:
     """Rebuild axis-aligned wall strips with widths selected from data.json."""
     roi_height, roi_width = roi.shape
-    kernel_length = max(7, int(round(estimated_thickness * 0.5)))
+    kernel_length = max(7, int(round(estimated_thickness * 2)))
     x_bands, y_bands = dimension_wall_bands()
     minimum_width = min(WALL_WIDTHS_MM)
     exterior_widths = [value for value in WALL_WIDTHS_MM if value > minimum_width]
